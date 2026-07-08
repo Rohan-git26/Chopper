@@ -12,6 +12,7 @@
 #include "mic.h"
 #include "opus_encoder.h"
 #include "ota.h"
+#include "wifi_photo.h"
 
 // Battery state
 float batteryVoltage = 0.0f;
@@ -261,8 +262,8 @@ void exitPowerSave()
 
 void enableLightSleep()
 {
-    if (!lightSleepEnabled || !connected || photoDataUploading) {
-        return; // Don't sleep if disabled, not connected, or uploading
+    if (!lightSleepEnabled || !connected || photoDataUploading || wifiPhoto_isActive()) {
+        return; // Don't sleep if disabled, not connected, uploading, or WiFi is up
     }
 
     unsigned long now = millis();
@@ -477,12 +478,17 @@ class PhotoControlCallback : public BLECharacteristicCallbacks
 {
     void onWrite(BLECharacteristic *characteristic) override
     {
-        if (characteristic->getLength() == 1) {
-            int8_t received = characteristic->getData()[0];
+        size_t len = characteristic->getLength();
+        lastActivity = millis(); // Register activity - prevents sleep
+        if (len == 1) {
+            // Legacy single-byte BLE capture control (-1 single, 0 stop, 5-300 interval).
+            int8_t received = (int8_t) characteristic->getData()[0];
             Serial.print("PhotoControl received: ");
             Serial.println(received);
-            lastActivity = millis(); // Register activity - prevents sleep
             handlePhotoControl(received);
+        } else if (len >= 2) {
+            // Multi-byte writes are WiFi photo commands (set creds / disconnect).
+            wifiPhoto_handleCommand(characteristic->getData(), len);
         }
     }
 };
@@ -588,6 +594,7 @@ void configure_ble()
 {
     Serial.println("Initializing BLE...");
     BLEDevice::init(BLE_DEVICE_NAME);
+    BLEDevice::setMTU(BLE_MTU_SIZE); // Allow large photo chunks (client also requests 517)
     BLEServer *server = BLEDevice::createServer();
     server->setCallbacks(new ServerHandler());
 
@@ -822,9 +829,10 @@ void setup_app()
 
     configure_ble();
     configure_camera();
+    wifiPhoto_setup();
 
-    // Allocate buffer for photo chunks (200 bytes + 2 for frame index)
-    s_compressed_frame_2 = (uint8_t *) ps_calloc(202, sizeof(uint8_t));
+    // Allocate buffer for photo chunks (BLE_CHUNK_SIZE payload + 3-byte header)
+    s_compressed_frame_2 = (uint8_t *) ps_calloc(BLE_CHUNK_SIZE + 3, sizeof(uint8_t));
     if (!s_compressed_frame_2) {
         Serial.println("Failed to allocate chunk buffer!");
     } else {
@@ -832,7 +840,7 @@ void setup_app()
     }
 
     // Set default capture interval from config
-    isCapturingPhotos = true;
+    isCapturingPhotos = false;
     captureInterval = PHOTO_CAPTURE_INTERVAL_MS;
     lastCaptureTime = millis() - captureInterval;
     Serial.print("Default capture interval set to ");
@@ -879,6 +887,9 @@ void loop_app()
     // Process OTA updates
     ota_loop();
 
+    // Service the WiFi photo transport (connect state machine + HTTP server)
+    wifiPhoto_loop();
+
     // Process microphone data - always run to keep audio realtime
     if (audioEnabled && mic_is_running()) {
         mic_process();
@@ -890,10 +901,12 @@ void loop_app()
         processAudioTx();
     }
 
-    // Check for power save mode (gentle optimization)
-    if (!connected && !photoDataUploading && (now - lastActivity > IDLE_THRESHOLD_MS)) {
+    // Check for power save mode (gentle optimization). Never throttle the CPU
+    // while WiFi is active — the WiFi stack needs the higher clock.
+    if (!connected && !photoDataUploading && !wifiPhoto_isActive() &&
+        (now - lastActivity > IDLE_THRESHOLD_MS)) {
         enterPowerSave();
-    } else if (connected || photoDataUploading) {
+    } else if (connected || photoDataUploading || wifiPhoto_isActive()) {
         if (powerSaveMode)
             exitPowerSave();
         lastActivity = now;
@@ -949,14 +962,14 @@ void loop_app()
                 s_compressed_frame_2[0] = 0; // Frame index low byte
                 s_compressed_frame_2[1] = 0; // Frame index high byte
                 s_compressed_frame_2[2] = (uint8_t) current_photo_orientation;
-                bytes_to_copy = (remaining > 199) ? 199 : remaining;
+                bytes_to_copy = (remaining > BLE_CHUNK_SIZE) ? BLE_CHUNK_SIZE : remaining;
                 memcpy(&s_compressed_frame_2[3], &fb->buf[sent_photo_bytes], bytes_to_copy);
                 photoDataCharacteristic->setValue(s_compressed_frame_2, bytes_to_copy + 3);
             } else {
                 // Subsequent chunks
                 s_compressed_frame_2[0] = (uint8_t) (sent_photo_frames & 0xFF);
                 s_compressed_frame_2[1] = (uint8_t) ((sent_photo_frames >> 8) & 0xFF);
-                bytes_to_copy = (remaining > 200) ? 200 : remaining;
+                bytes_to_copy = (remaining > BLE_CHUNK_SIZE) ? BLE_CHUNK_SIZE : remaining;
                 memcpy(&s_compressed_frame_2[2], &fb->buf[sent_photo_bytes], bytes_to_copy);
                 photoDataCharacteristic->setValue(s_compressed_frame_2, bytes_to_copy + 2);
             }

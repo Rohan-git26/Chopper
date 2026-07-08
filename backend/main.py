@@ -3,6 +3,7 @@ import base64
 import json
 import logging
 import os
+from datetime import datetime
 
 from dotenv import load_dotenv
 from example_agent.agent import build_agent
@@ -31,6 +32,40 @@ logging.basicConfig(
 )
 
 initialize_firebase()
+
+# Directory where images received from clients are saved. Override with the
+# IMAGE_SAVE_DIR env var; defaults to ./received_images next to this file.
+IMAGE_SAVE_DIR = os.getenv("IMAGE_SAVE_DIR", "received_images")
+
+# Map incoming image mime types to file extensions.
+_IMAGE_EXTENSIONS = {
+    "image/jpeg": ".jpg",
+    "image/jpg": ".jpg",
+    "image/png": ".png",
+    "image/webp": ".webp",
+    "image/gif": ".gif",
+}
+
+
+def save_image(data: bytes, mime_type: str) -> str | None:
+    """Save a received image to IMAGE_SAVE_DIR with a timestamped filename.
+
+    Returns the saved file path, or None if saving failed.
+    """
+    try:
+        os.makedirs(IMAGE_SAVE_DIR, exist_ok=True)
+        ext = _IMAGE_EXTENSIONS.get(mime_type.lower(), ".bin")
+        # e.g. 20260707_181530_123456.jpg
+        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        path = os.path.join(IMAGE_SAVE_DIR, f"{timestamp}{ext}")
+        with open(path, "wb") as f:
+            f.write(data)
+        logging.info("Saved received image (%d bytes) to %s", len(data), path)
+        return path
+    except Exception as e:
+        logging.error("Failed to save received image: %s", e)
+        return None
+
 
 async def start_agent_session(user_id: str, control_queue: asyncio.Queue):
     """Starts an agent session"""
@@ -308,6 +343,9 @@ async def client_to_agent_messaging(
                         continue
 
                     decoded_data = base64.b64decode(data)
+
+                    # Persist the received image to disk for later inspection.
+                    save_image(decoded_data, mime_type)
 
                     content = Content(
                         role="user",
