@@ -10,7 +10,12 @@ import 'package:flutter_dotenv/flutter_dotenv.dart';
 class AppConfig {
   static const String _defaultWsUrl = 'ws://10.0.2.2:8000/ws/chopper-user';
 
+  static String? customWsUrl;
+
   static String get wsUrl {
+    if (customWsUrl != null && customWsUrl!.isNotEmpty) {
+      return customWsUrl!;
+    }
     final value = (dotenv.maybeGet('ADK_WS_URL') ?? '').trim();
     return value.isEmpty ? _defaultWsUrl : value;
   }

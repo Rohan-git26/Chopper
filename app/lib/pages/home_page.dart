@@ -1,6 +1,7 @@
 import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
+import '../providers/auth_provider.dart';
 import '../providers/chat_provider.dart';
 import 'chat_page.dart';
 import 'device_page.dart';
@@ -11,6 +12,9 @@ class HomePage extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final authProvider = context.watch<AuthProvider>();
+    final userName = authProvider.user?.displayName;
+
     return Scaffold(
       backgroundColor: const Color(0xFF0E0E12),
       body: SafeArea(
@@ -74,11 +78,7 @@ class HomePage extends StatelessWidget {
                                 child: IconButton(
                                   padding: EdgeInsets.zero,
                                   icon: const Icon(Icons.settings, color: Colors.white70, size: 20),
-                                  onPressed: () {
-                                    ScaffoldMessenger.of(context).showSnackBar(
-                                      const SnackBar(content: Text('Settings coming soon')),
-                                    );
-                                  },
+                                  onPressed: () => _openSettings(context),
                                 ),
                               ),
                             ],
@@ -92,10 +92,26 @@ class HomePage extends StatelessWidget {
               // Subtitle now lives centered in the empty middle of the screen
               Expanded(
                 child: Center(
-                  child: Text(
-                    'Your wearable AI companion',
-                    style: TextStyle(color: Colors.grey[500], fontSize: 16),
-                    textAlign: TextAlign.center,
+                  child: Column(
+                    mainAxisAlignment: MainAxisAlignment.center,
+                    children: [
+                      if (userName != null && userName.isNotEmpty) ...[
+                        Text(
+                          'Hello, $userName!',
+                          style: const TextStyle(
+                            color: Colors.white,
+                            fontSize: 24,
+                            fontWeight: FontWeight.w600,
+                          ),
+                        ),
+                        const SizedBox(height: 8),
+                      ],
+                      Text(
+                        'Your wearable AI companion',
+                        style: TextStyle(color: Colors.grey[500], fontSize: 16),
+                        textAlign: TextAlign.center,
+                      ),
+                    ],
                   ),
                 ),
               ),
@@ -144,6 +160,18 @@ class HomePage extends StatelessWidget {
       MaterialPageRoute(builder: (_) => const DevicePage()),
     );
   }
+
+  void _openSettings(BuildContext context) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      backgroundColor: const Color(0xFF15151B),
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(20)),
+      ),
+      builder: (context) => const SettingsSheet(),
+    );
+  }
 }
 
 /// Omi-style status pill shown top-left: icon + connection state text,
@@ -184,4 +212,176 @@ class _StatusPill extends StatelessWidget {
   }
 }
 
-// `DevicePage` has been moved to `lib/pages/device_page.dart`.
+class SettingsSheet extends StatefulWidget {
+  const SettingsSheet({super.key});
+
+  @override
+  State<SettingsSheet> createState() => _SettingsSheetState();
+}
+
+class _SettingsSheetState extends State<SettingsSheet> {
+  late final TextEditingController _controller;
+
+  @override
+  void initState() {
+    super.initState();
+    final currentUrl = Provider.of<ChatProvider>(context, listen: false).customWsUrl;
+    _controller = TextEditingController(text: currentUrl);
+  }
+
+  @override
+  void dispose() {
+    _controller.dispose();
+    super.dispose();
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final authProvider = context.watch<AuthProvider>();
+    final chatProvider = context.read<ChatProvider>();
+    final user = authProvider.user;
+
+    return Padding(
+      padding: EdgeInsets.fromLTRB(
+        20,
+        20,
+        20,
+        MediaQuery.of(context).viewInsets.bottom + 20,
+      ),
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            mainAxisAlignment: MainAxisAlignment.spaceBetween,
+            children: [
+              const Text(
+                'Settings',
+                style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold),
+              ),
+              IconButton(
+                icon: const Icon(Icons.close, color: Colors.white70),
+                onPressed: () => Navigator.pop(context),
+              ),
+            ],
+          ),
+          const SizedBox(height: 16),
+          if (user != null) ...[
+            Text(
+              'Account',
+              style: TextStyle(color: Colors.grey[400], fontSize: 13, fontWeight: FontWeight.w600),
+            ),
+            const SizedBox(height: 8),
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
+              decoration: BoxDecoration(
+                color: const Color(0xFF1F1F25),
+                borderRadius: BorderRadius.circular(12),
+              ),
+              child: Row(
+                children: [
+                  CircleAvatar(
+                    backgroundColor: Colors.teal,
+                    radius: 20,
+                    child: Text(
+                      (user.displayName ?? user.email ?? 'U')[0].toUpperCase(),
+                      style: const TextStyle(color: Colors.white, fontWeight: FontWeight.bold),
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      children: [
+                        if (user.displayName != null)
+                          Text(
+                            user.displayName!,
+                            style: const TextStyle(color: Colors.white, fontWeight: FontWeight.w600),
+                          ),
+                        Text(
+                          user.email ?? 'No email',
+                          style: TextStyle(color: Colors.grey[500], fontSize: 12),
+                        ),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            ),
+            const SizedBox(height: 20),
+          ],
+          Text(
+            'ADK WebSocket URL Override',
+            style: TextStyle(color: Colors.grey[400], fontSize: 13, fontWeight: FontWeight.w600),
+          ),
+          const SizedBox(height: 8),
+          TextField(
+            controller: _controller,
+            style: const TextStyle(color: Colors.white),
+            decoration: InputDecoration(
+              hintText: 'e.g. ws://10.0.2.2:8000/ws/chopper-user',
+              hintStyle: TextStyle(color: Colors.grey[600]),
+              filled: true,
+              fillColor: const Color(0xFF1F1F25),
+              border: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+                borderSide: const BorderSide(color: Color(0xFF35343B)),
+              ),
+              focusedBorder: OutlineInputBorder(
+                borderRadius: BorderRadius.circular(12),
+                borderSide: const BorderSide(color: Colors.teal),
+              ),
+            ),
+          ),
+          const SizedBox(height: 8),
+          Text(
+            'Leave empty to use default endpoint from .env.',
+            style: TextStyle(color: Colors.grey[500], fontSize: 11),
+          ),
+          const SizedBox(height: 24),
+          Row(
+            children: [
+              Expanded(
+                child: OutlinedButton(
+                  style: OutlinedButton.styleFrom(
+                    foregroundColor: Colors.redAccent,
+                    side: const BorderSide(color: Colors.redAccent),
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  ),
+                  onPressed: () {
+                    Navigator.pop(context);
+                    authProvider.signOut();
+                  },
+                  child: const Text('Sign Out'),
+                ),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: ElevatedButton(
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: Colors.teal,
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
+                  ),
+                  onPressed: () async {
+                    final newUrl = _controller.text;
+                    await chatProvider.setCustomWsUrl(newUrl);
+                    if (mounted) {
+                      Navigator.pop(context);
+                      ScaffoldMessenger.of(context).showSnackBar(
+                        const SnackBar(content: Text('Settings saved & reconnecting…')),
+                      );
+                    }
+                  },
+                  child: const Text('Save & Apply'),
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
+  }
+}

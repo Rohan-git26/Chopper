@@ -78,6 +78,8 @@ dev_dependencies:
   flutter_test:
     sdk: flutter
 
+  flutter_launcher_icons: ^0.13.1
+
   # The "flutter_lints" package below contains a set of recommended lints to
   # encourage good coding practices. The lint set provided by the package is
   # activated in the `analysis_options.yaml` file located at the root of your
@@ -99,6 +101,7 @@ flutter:
   # Runtime config file (ADK endpoint). Edit .env and hot-restart.
   assets:
     - .env
+    - assets/logo.png
 
   # To add assets to your application, add an assets section, like this:
   # assets:
@@ -130,5 +133,11 @@ flutter:
   #
   # For details regarding fonts from package dependencies,
   # see https://flutter.dev/to/font-from-package
+
+
+flutter_launcher_icons:
+  android: true
+  ios: false
+  image_path: "assets/logo.png"
 
 

@@ -1,11 +1,15 @@
 import 'dart:async';
+import 'dart:io' as io;
 import 'dart:math';
+import 'dart:typed_data';
 
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart' as fbp;
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../config.dart';
 import '../models/chat_message.dart';
 import '../services/adk_agent_service.dart';
 import '../services/app_log.dart';
@@ -217,6 +221,7 @@ class ChatProvider extends ChangeNotifier {
               // dedicated VGA still — the agent's vision input is degraded here.
               AppLog.instance.add('📸 snapshot from live video (CIF, ${snapshot.length} bytes)');
               _service.sendBlob(snapshot, 'image/jpeg');
+              _handleDevicePhoto(snapshot);
             } else {
               AppLog.instance.add('📸 capture skipped: live stream has no frame yet');
             }
@@ -421,6 +426,7 @@ class ChatProvider extends ChangeNotifier {
       _devicePhotoSub = _device.photoData.listen((jpeg) {
         AppLog.instance.add('📸 photo sent to agent: ${jpeg.length} bytes');
         _service.sendBlob(jpeg, 'image/jpeg');
+        _handleDevicePhoto(jpeg);
       });
     } catch (e, s) {
       // Connection or codec mismatch — surface in UI via deviceState stream.
@@ -486,10 +492,23 @@ class ChatProvider extends ChangeNotifier {
       _photoTransport = prefs.getString(_kPhotoTransport) == PhotoTransport.wifi.name
           ? PhotoTransport.wifi
           : PhotoTransport.ble;
+      AppConfig.customWsUrl = prefs.getString('custom_ws_url') ?? '';
       notifyListeners();
     } catch (_) {
       // Preferences unavailable — fall back to BLE defaults.
     }
+  }
+
+  String get customWsUrl => AppConfig.customWsUrl ?? '';
+
+  Future<void> setCustomWsUrl(String url) async {
+    AppConfig.customWsUrl = url.trim();
+    notifyListeners();
+    try {
+      final prefs = await _prefsInstance();
+      await prefs.setString('custom_ws_url', AppConfig.customWsUrl!);
+    } catch (_) {}
+    await _reconnect(isAudio: _service.isAudioMode);
   }
 
   // ---- Phone mic voice ------------------------------------------------------
@@ -500,6 +519,31 @@ class ChatProvider extends ChangeNotifier {
     await _audio.stopMic();
     voiceActive = false;
     notifyListeners();
+  }
+
+  Future<void> _handleDevicePhoto(Uint8List jpeg) async {
+    try {
+      final tempDir = await getTemporaryDirectory();
+      final filename = 'captured_${DateTime.now().millisecondsSinceEpoch}.jpg';
+      final file = io.File('${tempDir.path}/$filename');
+      await file.writeAsBytes(jpeg);
+
+      messages.add(ChatMessage(
+        id: _newId(),
+        sender: MessageSender.user,
+        attachments: [
+          Attachment(
+            path: file.path,
+            name: filename,
+            type: AttachmentType.image,
+          ),
+        ],
+      ));
+      revision++;
+      notifyListeners();
+    } catch (e) {
+      AppLog.instance.add('❌ failed to save captured photo: $e');
+    }
   }
 
   // ---- Helpers --------------------------------------------------------------
