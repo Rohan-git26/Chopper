@@ -135,4 +135,5 @@ Desktop.ini
 logs/
 
 
-backend/received_images
+backend/received_images
+backend/memories

@@ -7,7 +7,7 @@ import threading
 from datetime import datetime
 
 from dotenv import load_dotenv
-from chopper_agent.agent import build_agent
+from chopper_agent.agent import build_agent, SessionContext
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
 from google.adk.agents import LiveRequestQueue
 from google.adk.agents.run_config import RunConfig
@@ -22,9 +22,17 @@ from auth import authenticate_websocket, initialize_firebase
 
 load_dotenv()
 
+MEMORIES_DIR = os.getenv("MEMORIES_DIR", "memories")
+try:
+    os.makedirs(MEMORIES_DIR, exist_ok=True)
+except Exception as e:
+    logging.error("Could not create memories dir %s: %s", MEMORIES_DIR, e)
+
 # Configure logging for the server and agent events
+log_level_str = os.getenv("LOG_LEVEL", "INFO").upper()
+log_level = getattr(logging, log_level_str, logging.INFO)
 logging.basicConfig(
-    level=logging.INFO,
+    level=log_level,
     format="%(asctime)s %(levelname)s %(message)s",
 )
 
@@ -119,10 +127,14 @@ async def save_image(data: bytes, mime_type: str) -> None:
     await asyncio.to_thread(_write_image_sync, data, mime_type)
 
 
-async def start_agent_session(user_id: str, control_queue: asyncio.Queue):
+async def start_agent_session(
+    user_id: str,
+    control_queue: asyncio.Queue,
+    session_context: SessionContext,
+):
     """Starts an agent session"""
 
-    agent = build_agent(control_queue)
+    agent = build_agent(control_queue, session_context, user_id, MEMORIES_DIR)
 
     # Create a Runner
     runner = InMemoryRunner(app_name=os.getenv("APP_NAME"), agent=agent)
@@ -172,110 +184,12 @@ async def start_agent_session(user_id: str, control_queue: asyncio.Queue):
     return live_events, live_request_queue
 
 
-# async def agent_to_client_messaging(websocket: WebSocket, live_events):
-#     """Agent to client communication: Sends structured event data."""
-#     async for event in live_events:
-#         logging.debug(f"Received agent event: {event}")
-#         try:
-#             message_to_send = {
-#                 "author": event.author or "agent",
-#                 "is_partial": event.partial or False,
-#                 "turn_complete": event.turn_complete or False,
-#                 "interrupted": event.interrupted or False,
-#                 "parts": [],
-#                 "input_transcription": None,
-#                 "output_transcription": None,
-#             }
 
-#             # if not event.content:
-#             #     if (
-#             #         message_to_send["turn_complete"]
-#             #         or message_to_send["interrupted"]
-#             #     ):
-#             #         await websocket.send_text(json.dumps(message_to_send))
-#             #     continue
-
-#             # logging.debug(
-#             #     "Event has content; parts=%s",
-#             #     [getattr(p, 'text', None) for p in getattr(event.content, 'parts', [])],
-#             # )
-
-#             # Use the dedicated server-side transcription objects instead of
-#             # reading part.text directly. The native-audio preview model
-#             # bundles a chain-of-thought "intent statement" into the same
-#             # text part as the spoken reply, but output_transcription /
-#             # input_transcription are clean TTS / STT of the audio and never
-#             # contain thoughts.
-#             input_tx = getattr(event, "input_transcription", None)
-#             if input_tx and getattr(input_tx, "text", None):
-#                 message_to_send["input_transcription"] = {
-#                     "text": input_tx.text,
-#                     "is_final": getattr(input_tx, "finished", False),
-#                 }
-
-#             output_tx = getattr(event, "output_transcription", None)
-#             if output_tx and getattr(output_tx, "text", None):
-#                 message_to_send["output_transcription"] = {
-#                     "text": output_tx.text,
-#                     "is_final": getattr(output_tx, "finished", False),
-#                 }
-
-#             # Only forward audio (and function calls/responses) from
-#             # event.content.parts. Text display uses output_transcription
-#             # above, so we deliberately do NOT push part.text into parts.
-#             if event.content and event.content.parts:
-#                 for part in event.content.parts:
-#                     if (
-#                         part.inline_data
-#                         and part.inline_data.mime_type.startswith("audio/pcm")
-#                     ):
-#                         audio_data = part.inline_data.data
-#                         encoded_audio = base64.b64encode(audio_data).decode(
-#                             "ascii"
-#                         )
-#                         message_to_send["parts"].append(
-#                             {"type": "audio/pcm", "data": encoded_audio}
-#                         )
-
-#                     elif part.function_call:
-#                         message_to_send["parts"].append(
-#                             {
-#                                 "type": "function_call",
-#                                 "data": {
-#                                     "name": part.function_call.name,
-#                                     "args": part.function_call.args or {},
-#                                 },
-#                             }
-#                         )
-
-#                     elif part.function_response:
-#                         message_to_send["parts"].append(
-#                             {
-#                                 "type": "function_response",
-#                                 "data": {
-#                                     "name": part.function_response.name,
-#                                     "response": part.function_response.response
-#                                     or {},
-#                                 },
-#                             }
-#                         )
-
-#             if (
-#                 message_to_send["parts"]
-#                 or message_to_send["turn_complete"]
-#                 or message_to_send["interrupted"]
-#                 or message_to_send["input_transcription"]
-#                 or message_to_send["output_transcription"]
-#             ):
-#                 payload = json.dumps(message_to_send)
-#                 logging.info(f"Sending payload to client: {payload}")
-#                 await websocket.send_text(payload)
-
-#         except Exception as e:
-#             logging.error(f"Error in agent_to_client_messaging: {e}")
-
-
-async def agent_to_client_messaging(websocket: WebSocket, live_events):
+async def agent_to_client_messaging(
+    websocket: WebSocket,
+    live_events,
+    session_context: SessionContext,
+):
 
     async for event in live_events:
         try:
@@ -292,20 +206,24 @@ async def agent_to_client_messaging(websocket: WebSocket, live_events):
             # 1.Input Transcription (USER STT)
             input_tx = getattr(event, "input_transcription", None)
             if input_tx and getattr(input_tx, "text", None):
+                is_final = getattr(input_tx, "finished", False)
                 message["input_transcription"] = {
                     "text": input_tx.text,
-                    "is_final": getattr(input_tx, "finished", False),
+                    "is_final": is_final,
                 }
-                logging.info("Input transcription: %s", message["input_transcription"])
+                if is_final:
+                    logging.info("User: %s", input_tx.text)
 
             # 2.Output Transcription (MODEL TTS)
             output_tx = getattr(event, "output_transcription", None)
             if output_tx and getattr(output_tx, "text", None):
+                is_final = getattr(output_tx, "finished", False)
                 message["output_transcription"] = {
                     "text": output_tx.text,
-                    "is_final": getattr(output_tx, "finished", False),
+                    "is_final": is_final,
                 }
-                logging.info("Output transcription: %s", message["output_transcription"])
+                if is_final:
+                    logging.info("Agent: %s", output_tx.text)
 
             # 3.Content Parts — only forward audio; text display uses output_transcription
             if event.content and event.content.parts:
@@ -328,6 +246,12 @@ async def agent_to_client_messaging(websocket: WebSocket, live_events):
                         #     json.dumps({"type": "capture_image"})
                         # )
 
+            # 4. Suppress output if the agent called stay_silent
+            if session_context.suppress_current_turn:
+                message["parts"] = []
+                message["output_transcription"] = None
+                message["turn_complete"] = False
+
             # Send only if meaningful
             if (
                 message["parts"]
@@ -338,11 +262,17 @@ async def agent_to_client_messaging(websocket: WebSocket, live_events):
             ):
                 await websocket.send_text(json.dumps(message))
 
+            # 5. Reset turn flags on completion
+            if event.turn_complete:
+                session_context.suppress_current_turn = False
+
         except Exception as e:
             logging.error("agent_to_client_messaging error: %s", e)
 
 async def client_to_agent_messaging(
-    websocket: WebSocket, live_request_queue: LiveRequestQueue
+    websocket: WebSocket,
+    live_request_queue: LiveRequestQueue,
+    session_context: SessionContext,
 ):
     """Client to agent communication — binary frames for audio, text frames for JSON control."""
     while True:
@@ -350,7 +280,6 @@ async def client_to_agent_messaging(
             raw = await websocket.receive()
 
             if raw["type"] == "websocket.disconnect":
-                logging.info("Client disconnected.")
                 break
 
             # Binary frame → raw PCM audio (no base64 overhead)
@@ -378,7 +307,6 @@ async def client_to_agent_messaging(
                         role="user", parts=[Part.from_text(text=data)]
                     )
                     live_request_queue.send_content(content=content)
-                    logging.info("Text sent as content turn")
 
                 elif mime_type == "audio/pcm":
                     data = message.get("data")
@@ -416,14 +344,12 @@ async def client_to_agent_messaging(
                     )
 
                     live_request_queue.send_content(content=content)
-
-                    logging.info("Image sent as content turn")
+                    logging.info("Image sent to agent (%d bytes)", len(decoded_data))
 
                 else:
                     logging.warning("Mime type not supported: %s", mime_type)
 
         except WebSocketDisconnect:
-            logging.info("Client disconnected (WebSocketDisconnect).")
             break
 
         except Exception as e:
@@ -435,64 +361,6 @@ async def control_queue_to_client(websocket: WebSocket, control_queue: asyncio.Q
         if (msg.get("type") == "capture_image"):
             logging.info("Agent requested capture_image; notifying client; reading from queue")
             await websocket.send_text(json.dumps(msg))
-
-# async def client_to_agent_messaging(
-#     websocket: WebSocket, live_request_queue: LiveRequestQueue
-# ):
-#     """Client to agent communication"""
-#     while True:
-#         try:
-#             message_json = await websocket.receive_text()
-#             message = json.loads(message_json)
-#             logging.debug(f"Received message from client with mime_type: {message.get('mime_type')}")
-#             mime_type = message.get("mime_type")
-
-#             if mime_type == "text/plain":
-#                 data = message["data"]
-#                 content = Content(
-#                     role="user", parts=[Part.from_text(text=data)]
-#                 )
-#                 live_request_queue.send_content(content=content)
-#                 logging.info(f"Sent text content to agent queue: {data}")
-
-#             elif mime_type == "audio/pcm":
-#                 data = message["data"]
-#                 decoded_data = base64.b64decode(data)
-#                 live_request_queue.send_realtime(
-#                     Blob(data=decoded_data, mime_type=mime_type)
-#                 )
-#                 # logging.info("Sent realtime audio blob to agent queue (audio/pcm)")
-
-#             elif mime_type == "image/jpeg":
-#                 data = message["data"]
-#                 decoded_data = base64.b64decode(data)
-#                 live_request_queue.send_realtime(
-#                     Blob(data=decoded_data, mime_type=mime_type)
-#                 )
-#                 # logging.info("Sent realtime image blob to agent queue (image/jpeg)")
-
-#             else:
-#                 logging.warning(f"Mime type not supported: {mime_type}")
-
-#         except WebSocketDisconnect:
-#             logging.info("Client disconnected (WebSocketDisconnect).")
-#             break
-
-#         except Exception as e:
-#             logging.error(
-#                 f"An error occurred in client_to_agent_messaging: {e}"
-#             )
-
-# async def send_greeting(live_request_queue, greeting_text: str):
-#     """Inject a greeting as if the agent decided to speak first."""
-#     from google.genai import types
-
-#     content = types.Content(
-#         role="user",
-#         parts=[types.Part(text=greeting_text)]
-#     )
-
-#     live_request_queue.send_content(content=content)
 
 
 app = FastAPI()
@@ -516,16 +384,19 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 
     resolved_user_id = auth_user_id
     control_queue: asyncio.Queue = asyncio.Queue()
-    live_events, live_request_queue = await start_agent_session(resolved_user_id, control_queue)
+    session_context = SessionContext()
+    live_events, live_request_queue = await start_agent_session(
+        resolved_user_id, control_queue, session_context
+    )
 
     content = Content(role="user", parts=[Part.from_text(text="Start")])
     live_request_queue.send_content(content=content)
 
     agent_to_client_task = asyncio.create_task(
-        agent_to_client_messaging(websocket, live_events)
+        agent_to_client_messaging(websocket, live_events, session_context)
     )
     client_to_agent_task = asyncio.create_task(
-        client_to_agent_messaging(websocket, live_request_queue)
+        client_to_agent_messaging(websocket, live_request_queue, session_context)
     )
     control_task = asyncio.create_task(
         control_queue_to_client(websocket, control_queue)
@@ -541,5 +412,5 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
         await asyncio.gather(*tasks, return_exceptions=True)
 
     live_request_queue.close()
-    print(f"Client #{resolved_user_id} disconnected")
+    logging.info("Client #%s disconnected", resolved_user_id)
 

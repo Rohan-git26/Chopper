@@ -21,8 +21,6 @@ def initialize_firebase() -> None:
         "GOOGLE_APPLICATION_CREDENTIALS"
     )
 
-    print(f"Credential Path: {credential_path}")
-
     project_id = os.getenv("FIREBASE_PROJECT_ID") or os.getenv("GOOGLE_CLOUD_PROJECT")
 
     if credential_path:
@@ -30,13 +28,11 @@ def initialize_firebase() -> None:
         # not whatever directory the process happened to be launched from.
         resolved = Path(credential_path)
         
-        print(f"Credential Path: {credential_path}")
-        print(f"Resolved Path: {resolved}")
 
         if not resolved.is_absolute():
             resolved = (BASE_DIR / credential_path).resolve()
 
-        print(f"Final Resolved Path: {resolved}")
+        logger.info("Firebase credential path: %s (resolved: %s)", credential_path, resolved)
 
         if resolved.exists():
             options = {"projectId": project_id} if project_id else None
