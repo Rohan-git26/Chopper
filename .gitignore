@@ -133,3 +133,6 @@ Desktop.ini
 # Logs
 *.log
 logs/
+
+
+backend/received_images

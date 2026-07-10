@@ -90,6 +90,8 @@ class AuthGate extends StatelessWidget {
   Widget build(BuildContext context) {
     final authProvider = context.watch<AuthProvider>();
     return authProvider.isAuthenticated ? const HomePage() : const AuthPage();
+    // return const HomePage();
   }
 }
 
+

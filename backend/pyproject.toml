@@ -1,9 +1,9 @@
 [project]
-name = "realtime-conversational-agent-server"
+name = "chopper-backend"
 version = "0.1.0"
-description = "Example application using the Gemini Live API and ADK."
+description = "Chopper wearable AI assistant backend — bridges WebSocket clients to Google ADK / Gemini Live API."
 authors = [
-    {name = "Stephen Allen", email = "stephenaallen@google.com"}
+    {name = "Rohan Nirmal", email = "rohan.nirmal@ril.com"}
 ]
 license = {text = "Apache License 2.0"}
 requires-python = ">=3.11"
@@ -27,8 +27,7 @@ dev = [
 ]
 
 [tool.ruff]
-# Point back to the Master template in the root
-extend = "../../../../pyproject.toml"
+# extend = "../../../../pyproject.toml"
 
 [tool.ruff.lint]
 ignore = ["C901", "PLR0912"]
@@ -37,17 +36,10 @@ ignore = ["C901", "PLR0912"]
 "__init__.py" = ["F401"]
 
 [tool.ruff.lint.isort]
-known-first-party = ["example_agent"]
+known-first-party = ["chopper_agent"]
 
 [tool.agent-starter-pack]
 example_question = "Help me solve a quadratic equation"
 
 [tool.agent-starter-pack.settings]
-agent_directory = "example_agent"
-
-[tool.hatch.build.targets.wheel]
-packages = ["example_agent"]
-
-[build-system]
-requires = ["hatchling"]
-build-backend = "hatchling.build"
+agent_directory = "chopper_agent"

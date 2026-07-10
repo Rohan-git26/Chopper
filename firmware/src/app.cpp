@@ -14,6 +14,9 @@
 #include "ota.h"
 #include "wifi_photo.h"
 
+#include <freertos/FreeRTOS.h>
+#include <freertos/semphr.h>
+
 // Battery state
 float batteryVoltage = 0.0f;
 int batteryPercentage = 0;
@@ -72,6 +75,11 @@ BLECharacteristic *otaDataCharacteristic;
 bool audioEnabled = true;
 volatile bool audioSubscribed = false;
 uint16_t audioPacketIndex = 0;
+
+// Negotiated ATT MTU (updated in ServerHandler::onMtuChanged). Photo chunk
+// sizes are clamped to this so notifications are never silently truncated on
+// stacks that grant a smaller MTU than requested. 23 = BLE minimum default.
+volatile uint16_t g_negotiated_mtu = 23;
 
 // State
 bool connected = false;
@@ -435,8 +443,14 @@ class ServerHandler : public BLEServerCallbacks
     {
         connected = false;
         audioSubscribed = false;
+        g_negotiated_mtu = 23; // re-negotiated on the next connection
         Serial.println("<<< BLE Client disconnected. Restarting advertising.");
         BLEDevice::startAdvertising();
+    }
+    void onMtuChanged(BLEServer *server, esp_ble_gatts_cb_param_t *param) override
+    {
+        g_negotiated_mtu = param->mtu.mtu;
+        Serial.printf("BLE MTU negotiated: %u\n", (unsigned) g_negotiated_mtu);
     }
 };
 
@@ -703,6 +717,41 @@ void configure_ble()
 // -------------------------------------------------------------------------
 // Camera
 // -------------------------------------------------------------------------
+// Serializes ALL camera access so the sensor is never touched by two tasks at
+// once (loop-task captures vs the MJPEG stream task). Closes the TOCTOU window
+// that the s_streamClient flag alone only narrowed.
+static SemaphoreHandle_t s_cameraMutex = nullptr;
+
+void camera_lock()
+{
+    if (s_cameraMutex != nullptr) {
+        xSemaphoreTake(s_cameraMutex, portMAX_DELAY);
+    }
+}
+
+void camera_unlock()
+{
+    if (s_cameraMutex != nullptr) {
+        xSemaphoreGive(s_cameraMutex);
+    }
+}
+
+// Grab a guaranteed-fresh frame: discard the frame the driver already has
+// buffered (which can be a moment old — even with fb_count=2/GRAB_LATEST for
+// infrequent, on-demand captures), then grab the next one. Shared by the BLE
+// capture path (take_photo) and the WiFi /photo handler so both behave the same.
+camera_fb_t *capture_fresh_frame()
+{
+    camera_lock();
+    camera_fb_t *stale = esp_camera_fb_get();
+    if (stale) {
+        esp_camera_fb_return(stale);
+    }
+    camera_fb_t *f = esp_camera_fb_get();
+    camera_unlock();
+    return f;
+}
+
 bool take_photo()
 {
     // Release previous buffer
@@ -713,7 +762,7 @@ bool take_photo()
     }
 
     Serial.println("Capturing photo...");
-    fb = esp_camera_fb_get();
+    fb = capture_fresh_frame();
     if (!fb) {
         Serial.println("Failed to get camera frame buffer!");
         return false;
@@ -785,7 +834,10 @@ void configure_camera()
     // Use config.h camera settings optimized for battery life
     config.frame_size = CAMERA_FRAME_SIZE;
     config.pixel_format = PIXFORMAT_JPEG;
-    config.fb_count = 1;
+    // Two framebuffers + GRAB_LATEST so the driver always hands back the newest
+    // completed frame (fb_count=1 caused each capture to return the previous
+    // frame). The capture paths additionally discard one frame to be safe.
+    config.fb_count = 2;
     config.jpeg_quality = CAMERA_JPEG_QUALITY;
     config.fb_location = CAMERA_FB_IN_PSRAM;
     config.grab_mode = CAMERA_GRAB_LATEST;
@@ -828,6 +880,7 @@ void setup_app()
     lastActivity = millis();
 
     configure_ble();
+    s_cameraMutex = xSemaphoreCreateMutex();
     configure_camera();
     wifiPhoto_setup();
 
@@ -927,8 +980,15 @@ void loop_app()
         firstBatteryUpdate = false;
     }
 
-    // Check if it's time to capture a photo
-    if (isCapturingPhotos && !photoDataUploading && connected) {
+    // While streaming, drop any pending single-shot so it doesn't fire stale
+    // when the stream stops (the app snapshots the live frame instead).
+    if (wifiPhoto_isStreaming() && isCapturingPhotos && captureInterval == 0) {
+        isCapturingPhotos = false;
+    }
+
+    // Check if it's time to capture a photo. Never grab the camera while the
+    // MJPEG stream is running — the stream is the single camera consumer then.
+    if (isCapturingPhotos && !photoDataUploading && connected && !wifiPhoto_isStreaming()) {
         if ((captureInterval == 0) || (now - lastCaptureTime >= (unsigned long) captureInterval)) {
             if (captureInterval == 0) {
                 // Single shot if interval=0
@@ -937,6 +997,11 @@ void loop_app()
             Serial.println("Interval reached. Capturing photo...");
             if (take_photo()) {
                 Serial.println("Photo capture successful. Starting upload...");
+                if (g_negotiated_mtu <= BLE_MIN_MTU) {
+                    // onMtuChanged hasn't fired yet — chunks will be tiny (~17B)
+                    // and the transfer very slow. Normally negotiated at connect.
+                    Serial.println("WARN: BLE MTU not negotiated yet; slow chunked upload");
+                }
                 photoDataUploading = true;
                 sent_photo_bytes = 0;
                 sent_photo_frames = 0;
@@ -957,19 +1022,29 @@ void loop_app()
         size_t remaining = fb->len - sent_photo_bytes;
         if (remaining > 0) {
             size_t bytes_to_copy;
+            // Clamp the payload to the negotiated ATT MTU (usable payload =
+            // MTU - BLE_ATT_OVERHEAD_BYTES) minus our per-chunk frame header, so
+            // a notification is never truncated on a stack that granted a smaller
+            // MTU than the 517 we requested. Falls back to BLE_CHUNK_SIZE when MTU
+            // is large. g_negotiated_mtu is >= BLE_MIN_MTU (23) so no underflow.
+            const size_t reserve = BLE_ATT_OVERHEAD_BYTES + BLE_PHOTO_HEADER_BYTES;
+            size_t max_payload = (g_negotiated_mtu > reserve)
+                                     ? (size_t) (g_negotiated_mtu - reserve)
+                                     : (size_t) (BLE_MIN_MTU - reserve);
+            size_t chunk = (max_payload < (size_t) BLE_CHUNK_SIZE) ? max_payload : (size_t) BLE_CHUNK_SIZE;
             if (sent_photo_frames == 0) {
                 // First chunk: includes orientation metadata
                 s_compressed_frame_2[0] = 0; // Frame index low byte
                 s_compressed_frame_2[1] = 0; // Frame index high byte
                 s_compressed_frame_2[2] = (uint8_t) current_photo_orientation;
-                bytes_to_copy = (remaining > BLE_CHUNK_SIZE) ? BLE_CHUNK_SIZE : remaining;
+                bytes_to_copy = (remaining > chunk) ? chunk : remaining;
                 memcpy(&s_compressed_frame_2[3], &fb->buf[sent_photo_bytes], bytes_to_copy);
                 photoDataCharacteristic->setValue(s_compressed_frame_2, bytes_to_copy + 3);
             } else {
                 // Subsequent chunks
                 s_compressed_frame_2[0] = (uint8_t) (sent_photo_frames & 0xFF);
                 s_compressed_frame_2[1] = (uint8_t) ((sent_photo_frames >> 8) & 0xFF);
-                bytes_to_copy = (remaining > BLE_CHUNK_SIZE) ? BLE_CHUNK_SIZE : remaining;
+                bytes_to_copy = (remaining > chunk) ? chunk : remaining;
                 memcpy(&s_compressed_frame_2[2], &fb->buf[sent_photo_bytes], bytes_to_copy);
                 photoDataCharacteristic->setValue(s_compressed_frame_2, bytes_to_copy + 2);
             }
@@ -1021,3 +1096,4 @@ void loop_app()
         delay(50); // Reduced delay with light sleep
     }
 }
+

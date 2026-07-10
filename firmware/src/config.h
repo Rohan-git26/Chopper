@@ -11,7 +11,7 @@
 // =============================================================================
 // DEVICE CONFIGURATION
 // =============================================================================
-#define BLE_DEVICE_NAME "Chopper Glass"
+#define BLE_DEVICE_NAME "Tony Tony Chopper"
 #define FIRMWARE_VERSION_STRING "2.3.2"
 #define HARDWARE_REVISION "ESP32-S3-v1.0"
 #define MANUFACTURER_NAME "Based Hardware"
@@ -44,8 +44,12 @@
 // =============================================================================
 // CAMERA CONFIGURATION - Power optimized for 6-8 hour battery life
 // =============================================================================
-#define CAMERA_FRAME_SIZE FRAMESIZE_VGA // 640x480 - optimal balance
+#define CAMERA_FRAME_SIZE FRAMESIZE_VGA // 640x480 - optimal balance (still photos)
 #define CAMERA_JPEG_QUALITY 25          // Slightly higher quality for better compression efficiency
+
+// Live video (MJPEG /stream) uses a lower resolution for a smoother frame rate;
+// the still-photo resolution above is restored when the stream stops.
+#define STREAM_FRAME_SIZE FRAMESIZE_CIF // 400x296 - smoother live video
 #define CAMERA_XCLK_FREQ 6000000        // 6MHz - reduced from 8MHz for power savings
 #define CAMERA_FB_IN_PSRAM CAMERA_FB_IN_PSRAM
 #define CAMERA_GRAB_LATEST CAMERA_GRAB_LATEST
@@ -77,6 +81,9 @@ typedef enum {
 // =============================================================================
 #define BLE_MTU_SIZE 517            // Maximum MTU for efficiency
 #define BLE_CHUNK_SIZE 500          // Safe chunk size for photo transfer
+#define BLE_MIN_MTU 23              // BLE minimum ATT MTU (pre-negotiation default)
+#define BLE_ATT_OVERHEAD_BYTES 3    // ATT notify overhead (usable payload = MTU - 3)
+#define BLE_PHOTO_HEADER_BYTES 3    // Max per-chunk photo frame header (first frame)
 #define BLE_PHOTO_TRANSFER_DELAY 3  // Fast transfer for connection stability
 #define BLE_TX_POWER ESP_PWR_LVL_N0 // Low power for 6+ hour battery life
 
@@ -190,6 +197,11 @@ typedef enum {
 #define WIFI_MAX_PASS_LEN 64
 #define OTA_MAX_URL_LEN 256
 
+// WiFi photo/video transport (wifi_photo.cpp)
+#define WIFI_PHOTO_HTTP_PORT 80          // GET /photo (still capture)
+#define WIFI_STREAM_HTTP_PORT 81         // GET /stream (MJPEG live video)
+#define WIFI_LINK_LOST_DEBOUNCE_MS 3000  // sustained link loss before teardown
+
 // =============================================================================
 // PIN DEFINITIONS (from camera_pins.h integration)
 // =============================================================================
@@ -260,3 +272,4 @@ typedef enum {
 } device_state_t;
 
 #endif // CONFIG_H
+

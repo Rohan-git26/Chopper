@@ -6,10 +6,10 @@ import firebase_admin
 from firebase_admin import auth as firebase_auth
 from firebase_admin import credentials
 
+from pathlib import Path
+
 logger = logging.getLogger(__name__)
 
-
-from pathlib import Path
 
 BASE_DIR = Path(__file__).resolve().parent  # folder containing auth.py
 

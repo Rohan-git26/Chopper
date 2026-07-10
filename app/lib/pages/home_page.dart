@@ -4,6 +4,7 @@ import 'package:provider/provider.dart';
 import '../providers/chat_provider.dart';
 import 'chat_page.dart';
 import 'device_page.dart';
+import 'log_page.dart';
 
 class HomePage extends StatelessWidget {
   const HomePage({super.key});
@@ -43,22 +44,44 @@ class HomePage extends StatelessWidget {
                         ),
                         Align(
                           alignment: Alignment.centerRight,
-                          child: Container(
-                            width: 42,
-                            height: 42,
-                            decoration: const BoxDecoration(
-                              color: Color(0xFF1F1F25),
-                              shape: BoxShape.circle,
-                            ),
-                            child: IconButton(
-                              padding: EdgeInsets.zero,
-                              icon: const Icon(Icons.settings, color: Colors.white70, size: 20),
-                              onPressed: () {
-                                ScaffoldMessenger.of(context).showSnackBar(
-                                  const SnackBar(content: Text('Settings coming soon')),
-                                );
-                              },
-                            ),
+                          child: Row(
+                            mainAxisSize: MainAxisSize.min,
+                            children: [
+                              Container(
+                                width: 42,
+                                height: 42,
+                                decoration: const BoxDecoration(
+                                  color: Color(0xFF1F1F25),
+                                  shape: BoxShape.circle,
+                                ),
+                                child: IconButton(
+                                  padding: EdgeInsets.zero,
+                                  tooltip: 'Logs',
+                                  icon: const Icon(Icons.terminal, color: Colors.white70, size: 20),
+                                  onPressed: () => Navigator.of(context).push(
+                                    MaterialPageRoute(builder: (_) => const LogPage()),
+                                  ),
+                                ),
+                              ),
+                              const SizedBox(width: 8),
+                              Container(
+                                width: 42,
+                                height: 42,
+                                decoration: const BoxDecoration(
+                                  color: Color(0xFF1F1F25),
+                                  shape: BoxShape.circle,
+                                ),
+                                child: IconButton(
+                                  padding: EdgeInsets.zero,
+                                  icon: const Icon(Icons.settings, color: Colors.white70, size: 20),
+                                  onPressed: () {
+                                    ScaffoldMessenger.of(context).showSnackBar(
+                                      const SnackBar(content: Text('Settings coming soon')),
+                                    );
+                                  },
+                                ),
+                              ),
+                            ],
                           ),
                         ),
                       ],
@@ -161,4 +184,4 @@ class _StatusPill extends StatelessWidget {
   }
 }
 
-// `DevicePage` has been moved to `lib/pages/device_page.dart`.
+// `DevicePage` has been moved to `lib/pages/device_page.dart`.

@@ -68,6 +68,9 @@ dependencies:
   # Runtime permission requests (BLE, location on Android 12+).
   permission_handler: ^12.0.3
 
+  # Persist WiFi photo-transport settings (SSID / password / transport mode).
+  shared_preferences: ^2.3.2
+
   # Keep the app alive in the background while BLE/audio streaming is active.
   flutter_foreground_task: ^8.11.0
 
@@ -128,3 +131,4 @@ flutter:
   # For details regarding fonts from package dependencies,
   # see https://flutter.dev/to/font-from-package
 
+

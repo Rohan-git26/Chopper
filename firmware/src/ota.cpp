@@ -1,5 +1,7 @@
 #include "ota.h"
 #include "config.h"
+#include "wifi_creds.h"
+#include "wifi_net.h"
 
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
@@ -64,31 +66,12 @@ void ota_handle_command(uint8_t *data, size_t length) {
     switch (command) {
         case OTA_CMD_SET_WIFI: {
             // Format: [cmd, ssid_len, ssid..., pass_len, pass...]
-            if (length < 3) {
-                Serial.println("OTA: Invalid WiFi command length");
+            if (!parseWifiCreds(data, length, 1, wifiSSID, sizeof(wifiSSID),
+                                wifiPassword, sizeof(wifiPassword))) {
+                Serial.println("OTA: Invalid WiFi credentials");
                 ota_notify_status(OTA_STATUS_ERROR);
                 return;
             }
-
-            uint8_t ssidLen = data[1];
-            if (ssidLen > WIFI_MAX_SSID_LEN || length < 3 + ssidLen) {
-                Serial.println("OTA: Invalid SSID length");
-                ota_notify_status(OTA_STATUS_ERROR);
-                return;
-            }
-
-            memcpy(wifiSSID, &data[2], ssidLen);
-            wifiSSID[ssidLen] = '\0';
-
-            uint8_t passLen = data[2 + ssidLen];
-            if (passLen > WIFI_MAX_PASS_LEN || length < 3 + ssidLen + passLen) {
-                Serial.println("OTA: Invalid password length");
-                ota_notify_status(OTA_STATUS_ERROR);
-                return;
-            }
-
-            memcpy(wifiPassword, &data[3 + ssidLen], passLen);
-            wifiPassword[passLen] = '\0';
 
             wifiCredentialsSet = true;
             Serial.printf("OTA: WiFi credentials set - SSID: %s\n", wifiSSID);
@@ -208,8 +191,7 @@ static void ota_task(void *parameter) {
     delay(2000);  // Give time for BLE notification to be sent
 
     Serial.println("OTA: Disconnecting WiFi...");
-    WiFi.disconnect(true);
-    WiFi.mode(WIFI_OFF);
+    wifiRadioOff();
     delay(500);
 
     Serial.println("OTA: Rebooting now!");
@@ -223,8 +205,7 @@ static bool connect_wifi() {
     Serial.printf("OTA: Connecting to WiFi: %s\n", wifiSSID);
     ota_notify_status(OTA_STATUS_WIFI_CONNECTING);
 
-    WiFi.mode(WIFI_STA);
-    WiFi.begin(wifiSSID, wifiPassword);
+    wifiRadioBegin(wifiSSID, wifiPassword);
 
     unsigned long startTime = millis();
     while (WiFi.status() != WL_CONNECTED) {
@@ -406,3 +387,4 @@ void ota_cancel() {
         otaCancelled = true;
     }
 }
+

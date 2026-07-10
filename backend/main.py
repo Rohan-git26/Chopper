@@ -3,10 +3,11 @@ import base64
 import json
 import logging
 import os
+import threading
 from datetime import datetime
 
 from dotenv import load_dotenv
-from example_agent.agent import build_agent
+from chopper_agent.agent import build_agent
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
 from google.adk.agents import LiveRequestQueue
 from google.adk.agents.run_config import RunConfig
@@ -17,11 +18,7 @@ from google.genai.types import (
     Content,
     Part,
 )
-from starlette.websockets import WebSocketDisconnect
-
 from auth import authenticate_websocket, initialize_firebase
-
-# from example_agent.agent import root_agent
 
 load_dotenv()
 
@@ -47,24 +44,79 @@ _IMAGE_EXTENSIONS = {
 }
 
 
-def save_image(data: bytes, mime_type: str) -> str | None:
-    """Save a received image to IMAGE_SAVE_DIR with a timestamped filename.
+# Whether to persist received images, and how many to keep (oldest evicted
+# beyond this; 0 = unlimited). Overridable via env.
+SAVE_IMAGES = os.getenv("SAVE_IMAGES", "true").lower() != "false"
+MAX_SAVED_IMAGES = int(os.getenv("MAX_SAVED_IMAGES", "500"))
 
-    Returns the saved file path, or None if saving failed.
-    """
+# Create the directory ONCE at startup rather than on every frame (the web
+# client can send ~4 images/sec).
+if SAVE_IMAGES:
     try:
         os.makedirs(IMAGE_SAVE_DIR, exist_ok=True)
+    except Exception as e:  # noqa: BLE001
+        logging.error("Could not create image dir %s: %s", IMAGE_SAVE_DIR, e)
+        SAVE_IMAGES = False
+
+
+# Serializes cap enforcement across to_thread workers and throttles it so the
+# O(n) listdir+sort runs periodically rather than on every saved frame.
+_save_lock = threading.Lock()
+_save_count = 0
+_CAP_ENFORCE_EVERY = 50
+
+# Retains references to in-flight save tasks so they aren't garbage-collected
+# mid-run (asyncio only holds a weak ref to a bare create_task).
+_pending_saves: set[asyncio.Task] = set()
+
+
+def _enforce_image_cap() -> None:
+    """Delete the oldest files beyond MAX_SAVED_IMAGES. Runs in a worker thread."""
+    try:
+        files = [
+            p
+            for p in (os.path.join(IMAGE_SAVE_DIR, n) for n in os.listdir(IMAGE_SAVE_DIR))
+            if os.path.isfile(p)
+        ]
+        if len(files) <= MAX_SAVED_IMAGES:
+            return
+        files.sort(key=os.path.getmtime)
+        for old in files[: len(files) - MAX_SAVED_IMAGES]:
+            try:
+                os.remove(old)
+            except OSError:
+                pass
+    except Exception as e:  # noqa: BLE001
+        logging.error("Image cap enforcement failed: %s", e)
+
+
+def _write_image_sync(data: bytes, mime_type: str) -> None:
+    """Blocking image write + rotation. Runs off the event loop via to_thread."""
+    try:
         ext = _IMAGE_EXTENSIONS.get(mime_type.lower(), ".bin")
         # e.g. 20260707_181530_123456.jpg
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
         path = os.path.join(IMAGE_SAVE_DIR, f"{timestamp}{ext}")
         with open(path, "wb") as f:
             f.write(data)
+        if MAX_SAVED_IMAGES > 0:
+            # Enforce periodically under a lock: avoids the O(n) listdir+sort on
+            # every frame and serializes concurrent workers (no listdir/remove race).
+            global _save_count
+            with _save_lock:
+                _save_count += 1
+                if _save_count % _CAP_ENFORCE_EVERY == 0:
+                    _enforce_image_cap()
         logging.info("Saved received image (%d bytes) to %s", len(data), path)
-        return path
-    except Exception as e:
+    except Exception as e:  # noqa: BLE001
         logging.error("Failed to save received image: %s", e)
-        return None
+
+
+async def save_image(data: bytes, mime_type: str) -> None:
+    """Persist a received image without blocking the asyncio event loop."""
+    if not SAVE_IMAGES:
+        return
+    await asyncio.to_thread(_write_image_sync, data, mime_type)
 
 
 async def start_agent_session(user_id: str, control_queue: asyncio.Queue):
@@ -344,8 +396,12 @@ async def client_to_agent_messaging(
 
                     decoded_data = base64.b64decode(data)
 
-                    # Persist the received image to disk for later inspection.
-                    save_image(decoded_data, mime_type)
+                    # Persist the received image for later inspection, off the
+                    # hot path (fire-and-forget; never blocks agent bridging).
+                    # Retain the task reference so it isn't GC'd mid-run.
+                    _save_task = asyncio.create_task(save_image(decoded_data, mime_type))
+                    _pending_saves.add(_save_task)
+                    _save_task.add_done_callback(_pending_saves.discard)
 
                     content = Content(
                         role="user",
@@ -476,7 +532,14 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
     )
 
     tasks = [agent_to_client_task, client_to_agent_task, control_task]
-    await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    try:
+        await asyncio.wait(tasks, return_when=asyncio.FIRST_EXCEPTION)
+    finally:
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
 
     live_request_queue.close()
     print(f"Client #{resolved_user_id} disconnected")
+

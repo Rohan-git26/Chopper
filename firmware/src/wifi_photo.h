@@ -22,8 +22,9 @@
 #define WIFI_PHOTO_CMD_SET_WIFI   0x10 // [0x10, ssidLen, ssid..., passLen, pass...] -> connect
 #define WIFI_PHOTO_CMD_DISCONNECT 0x11 // [0x11] -> stop server + WiFi off
 
-// Status frames sent over the photo-data characteristic:
-//   [WIFI_PHOTO_STATUS_MARKER, status, <ascii ip if connected>]
+// Status frames sent over the photo-data characteristic. A TWO-byte magic is
+// used so a status frame can't alias a photo frame index:
+//   [WIFI_PHOTO_STATUS_MARKER, WIFI_PHOTO_STATUS_MARKER, status, <ascii ip if connected>]
 #define WIFI_PHOTO_STATUS_MARKER   0xF1
 #define WIFI_PHOTO_ST_DISCONNECTED 0x00
 #define WIFI_PHOTO_ST_CONNECTING   0x01
@@ -45,4 +46,11 @@ void wifiPhoto_handleCommand(const uint8_t *data, size_t len);
 // CPU throttling that would otherwise tear down the WiFi link.
 bool wifiPhoto_isActive();
 
+// True while a client is connected to the MJPEG /stream endpoint. While
+// streaming, the camera has exactly one consumer (the stream): still captures
+// (/photo and the BLE path) are refused so the driver is never accessed
+// concurrently from two tasks. The app instead snapshots the live stream frame.
+bool wifiPhoto_isStreaming();
+
 #endif // WIFI_PHOTO_H
+

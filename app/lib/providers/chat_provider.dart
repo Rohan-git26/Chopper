@@ -4,14 +4,20 @@ import 'dart:math';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart' as fbp;
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'package:shared_preferences/shared_preferences.dart';
 
 import '../models/chat_message.dart';
 import '../services/adk_agent_service.dart';
+import '../services/app_log.dart';
 import '../services/audio_io.dart';
+import '../services/mjpeg_stream.dart';
 import '../services/omi_device_service.dart';
 import '../services/opus_audio_decoder.dart';
 
 enum AgentConnection { connecting, connected, disconnected }
+
+/// Which transport carries captured photos from the glasses to the app.
+enum PhotoTransport { ble, wifi }
 
 /// Orchestrates the chat: owns the message list + composer state, drives the
 /// [AdkAgentService] and [AudioIo], and folds streamed agent events back into
@@ -54,6 +60,61 @@ class ChatProvider extends ChangeNotifier {
   int? _deviceBattery;
   int? get deviceBattery => _deviceBattery;
 
+  /// Last device-connection error, surfaced to the UI (null when none).
+  String? deviceError;
+
+  // ---- Photo transport (BLE vs WiFi) ---------------------------------------
+
+  PhotoTransport _photoTransport = PhotoTransport.ble;
+  PhotoTransport get photoTransport => _photoTransport;
+
+  String _wifiSsid = '';
+  String _wifiPassword = '';
+  String get wifiSsid => _wifiSsid;
+  String get wifiPassword => _wifiPassword;
+
+  // Persisted-settings keys + a cached SharedPreferences instance (obtained once).
+  static const String _kWifiSsid = 'wifi_ssid';
+  static const String _kWifiPassword = 'wifi_password';
+  static const String _kPhotoTransport = 'photo_transport';
+  SharedPreferences? _prefs;
+  Future<SharedPreferences> _prefsInstance() async =>
+      _prefs ??= await SharedPreferences.getInstance();
+
+  /// Live WiFi photo-transport status/IP from the device (over BLE).
+  WifiPhotoStatus get wifiPhotoStatus => _device.wifiPhotoStatus;
+  String? get wifiIp => _device.wifiIp;
+
+  StreamSubscription<WifiPhotoStatus>? _wifiStatusSub;
+
+  // ---- Live video (MJPEG over WiFi) ----------------------------------------
+  // Owned here (not in VideoPage) so the capture path can snapshot the latest
+  // frame while streaming — avoiding a second camera consumer on the device.
+  // MJPEG stream port on the device (firmware WIFI_STREAM_HTTP_PORT).
+  static const int _streamPort = 81;
+  final MjpegStream _video = MjpegStream();
+  ValueListenable<Uint8List?> get videoFrame => _video.frame;
+  ValueListenable<bool> get videoRunning => _video.running;
+  ValueListenable<String?> get videoError => _video.error;
+  bool get isStreaming => _video.running.value;
+  Uint8List? get lastVideoFrame => _video.frame.value;
+
+  /// Open the device's MJPEG stream (requires WiFi connected). Throws if no IP.
+  Future<void> startVideo() async {
+    final ip = _device.wifiIp;
+    if (ip == null) {
+      throw StateError('Device WiFi not connected');
+    }
+    await _video.start('http://$ip:$_streamPort/stream');
+    notifyListeners();
+  }
+
+  /// Stop the live stream.
+  Future<void> stopVideo() async {
+    await _video.stop();
+    notifyListeners();
+  }
+
   /// Bumped whenever new content arrives so the view can auto-scroll.
   int revision = 0;
 
@@ -62,6 +123,7 @@ class ChatProvider extends ChangeNotifier {
   bool _dropAudio = false;
   StreamSubscription<AdkEvent>? _eventsSub;
   StreamSubscription<Uint8List>? _micSub;
+  StreamSubscription<DeviceConnectionState>? _deviceStateSub;
   final Random _rnd = Random();
 
   bool get canSend => connection == AgentConnection.connected && !sendingMessage;
@@ -69,6 +131,15 @@ class ChatProvider extends ChangeNotifier {
 
   Future<void> _init() async {
     _eventsSub = _service.events.listen(_onEvent);
+    // Rebuild the UI whenever the glasses' BLE state changes so the status
+    // text reflects connecting/connected/error live.
+    _deviceStateSub = _device.connectionState.listen((state) {
+      AppLog.instance.add('BLE state: ${state.name}');
+      notifyListeners();
+    });
+    // Reflect device WiFi status/IP changes in the UI live.
+    _wifiStatusSub = _device.wifiStatus.listen((_) => notifyListeners());
+    await _loadPreferences();
     try {
       await _audio.initPlayer();
     } catch (_) {
@@ -99,6 +170,9 @@ class ChatProvider extends ChangeNotifier {
       case AdkConnectionChanged(:final connected, :final error):
         connection = connected ? AgentConnection.connected : AgentConnection.disconnected;
         connectionError = error;
+        if (!connected) {
+          sendingMessage = false;
+        }
       case AdkUserTranscript(:final text, :final isFinal):
         // Stream the user's own speech-to-text into a live user bubble.
         _ensurePendingUserTranscript();
@@ -130,8 +204,32 @@ class ChatProvider extends ChangeNotifier {
         _audio.flush();
       case AdkCaptureImage():
         debugPrint('AdkCaptureImage received; deviceConnected=$deviceConnected');
+        AppLog.instance.add(
+            '📸 capture_image received (connected=$deviceConnected, transport=${_photoTransport.name}, streaming=$isStreaming)');
         if (deviceConnected) {
-          _device.capturePhoto().catchError((_) {});
+          if (isStreaming) {
+            // Live video owns the camera on the device (a /photo or BLE capture
+            // would be refused/queued). Snapshot the frame we already have, or
+            // skip if the first frame hasn't decoded yet — never fall through.
+            final snapshot = lastVideoFrame;
+            if (snapshot != null) {
+              // NOTE: this is the stream resolution (CIF ~400x296), lower than a
+              // dedicated VGA still — the agent's vision input is degraded here.
+              AppLog.instance.add('📸 snapshot from live video (CIF, ${snapshot.length} bytes)');
+              _service.sendBlob(snapshot, 'image/jpeg');
+            } else {
+              AppLog.instance.add('📸 capture skipped: live stream has no frame yet');
+            }
+          } else if (_photoTransport == PhotoTransport.wifi) {
+            // WiFi mode is strict: no silent fallback to BLE — surface errors.
+            _device.capturePhotoOverWifi().catchError((e) {
+              AppLog.instance.add('📸 wifi capture error: $e');
+            });
+          } else {
+            _device.capturePhoto().catchError((_) {});
+          }
+        } else {
+          AppLog.instance.add('📸 ignored: glasses not connected');
         }
     }
     revision++;
@@ -195,6 +293,14 @@ class ChatProvider extends ChangeNotifier {
     revision++;
     notifyListeners();
 
+    // Safety timeout: re-enable send button if the agent takes more than 4 seconds to finish its turn
+    Timer(const Duration(seconds: 4), () {
+      if (sendingMessage) {
+        sendingMessage = false;
+        notifyListeners();
+      }
+    });
+
     for (final attachment in attachments) {
       try {
         final bytes = await attachment.file.readAsBytes();
@@ -233,6 +339,14 @@ class ChatProvider extends ChangeNotifier {
     voiceActive = false;
     sendingMessage = true; // awaiting the agent's spoken reply
     notifyListeners();
+
+    // Safety timeout: re-enable send button if the agent takes more than 4 seconds to finish its turn
+    Timer(const Duration(seconds: 4), () {
+      if (sendingMessage) {
+        sendingMessage = false;
+        notifyListeners();
+      }
+    });
   }
 
   // ---- Device audio (chopper glasses) --------------------------------------
@@ -264,6 +378,7 @@ class ChatProvider extends ChangeNotifier {
   /// ADK path (decoded → PCM16 → sendAudioChunk).
   Future<void> connectToDevice(fbp.BluetoothDevice dev) async {
     _opusDecoder.init();
+    deviceError = null;
     try {
       if (!_service.isAudioMode) {
         await _reconnect(isAudio: true);
@@ -304,11 +419,15 @@ class ChatProvider extends ChangeNotifier {
 
       // Wire reassembled JPEGs from the glasses → send to server as blobs.
       _devicePhotoSub = _device.photoData.listen((jpeg) {
+        AppLog.instance.add('📸 photo sent to agent: ${jpeg.length} bytes');
         _service.sendBlob(jpeg, 'image/jpeg');
       });
     } catch (e, s) {
       // Connection or codec mismatch — surface in UI via deviceState stream.
       debugPrint('connectToDevice error: $e\n$s');
+      AppLog.instance.add('❌ connect failed: $e');
+      deviceError = e.toString();
+      notifyListeners();
     }
   }
 
@@ -321,6 +440,56 @@ class ChatProvider extends ChangeNotifier {
     await FlutterForegroundTask.stopService();
     _deviceBattery = null;
     notifyListeners();
+  }
+
+  // ---- WiFi photo transport -------------------------------------------------
+
+  /// Switch the photo transport between BLE and WiFi (persisted).
+  Future<void> setPhotoTransport(PhotoTransport transport) async {
+    _photoTransport = transport;
+    notifyListeners();
+    try {
+      final prefs = await _prefsInstance();
+      await prefs.setString(_kPhotoTransport, transport.name);
+    } catch (_) {}
+  }
+
+  /// Save WiFi credentials and ask the connected device to join the network and
+  /// bring up its HTTP photo server. Credentials are persisted for next time.
+  Future<void> enableWifi(String ssid, String password) async {
+    _wifiSsid = ssid;
+    _wifiPassword = password;
+    await _persistWifiCredentials();
+    notifyListeners();
+    await _device.connectWifi(ssid, password);
+  }
+
+  /// Ask the device to drop WiFi and stop its HTTP server.
+  Future<void> disableWifi() async {
+    await _device.disconnectWifi();
+    notifyListeners();
+  }
+
+  Future<void> _persistWifiCredentials() async {
+    try {
+      final prefs = await _prefsInstance();
+      await prefs.setString(_kWifiSsid, _wifiSsid);
+      await prefs.setString(_kWifiPassword, _wifiPassword);
+    } catch (_) {}
+  }
+
+  Future<void> _loadPreferences() async {
+    try {
+      final prefs = await _prefsInstance();
+      _wifiSsid = prefs.getString(_kWifiSsid) ?? '';
+      _wifiPassword = prefs.getString(_kWifiPassword) ?? '';
+      _photoTransport = prefs.getString(_kPhotoTransport) == PhotoTransport.wifi.name
+          ? PhotoTransport.wifi
+          : PhotoTransport.ble;
+      notifyListeners();
+    } catch (_) {
+      // Preferences unavailable — fall back to BLE defaults.
+    }
   }
 
   // ---- Phone mic voice ------------------------------------------------------
@@ -374,6 +543,9 @@ class ChatProvider extends ChangeNotifier {
     unawaited(FlutterForegroundTask.stopService());
     _eventsSub?.cancel();
     _micSub?.cancel();
+    _deviceStateSub?.cancel();
+    _wifiStatusSub?.cancel();
+    _video.dispose();
     _scanSub?.cancel();
     _deviceAudioSub?.cancel();
     _devicePhotoSub?.cancel();
@@ -385,3 +557,4 @@ class ChatProvider extends ChangeNotifier {
   }
 }
 
+
