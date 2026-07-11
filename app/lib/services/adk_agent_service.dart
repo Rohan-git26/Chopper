@@ -7,6 +7,7 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/foundation.dart';
 
 import '../config.dart';
+import 'auth_service.dart';
 
 /// Events emitted by the ADK bidi-streaming server, normalized from the wire
 /// protocol into typed values the [ChatProvider] can pattern-match on.
@@ -177,6 +178,21 @@ class AdkAgentService {
       },
     );
     _events.add(const AdkConnectionChanged(true));
+
+    // Send Google OAuth Access Token to backend for Calendar/Tasks APIs
+    try {
+      final googleAccessToken = await AuthService.instance.getGoogleAccessToken();
+      if (googleAccessToken != null) {
+        _send({
+          'mime_type': 'application/x-google-auth',
+          'data': googleAccessToken,
+        });
+      }
+    } catch (e) {
+      if (kDebugMode) {
+        print("Failed to send Google Access Token to backend: $e");
+      }
+    }
   }
 
   void _onData(dynamic raw) {

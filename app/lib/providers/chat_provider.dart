@@ -508,7 +508,7 @@ class ChatProvider extends ChangeNotifier {
       final prefs = await _prefsInstance();
       await prefs.setString('custom_ws_url', AppConfig.customWsUrl!);
     } catch (_) {}
-    await _reconnect(isAudio: _service.isAudioMode);
+    unawaited(_reconnect(isAudio: _service.isAudioMode));
   }
 
   // ---- Phone mic voice ------------------------------------------------------

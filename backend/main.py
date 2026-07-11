@@ -203,7 +203,7 @@ async def agent_to_client_messaging(
                 "output_transcription": None,
             }
 
-            # 1.Input Transcription (USER STT)
+            # 1. Input Transcription (USER STT)
             input_tx = getattr(event, "input_transcription", None)
             if input_tx and getattr(input_tx, "text", None):
                 is_final = getattr(input_tx, "finished", False)
@@ -213,6 +213,23 @@ async def agent_to_client_messaging(
                 }
                 if is_final:
                     logging.info("User: %s", input_tx.text)
+                    # NOTE: engagement (`session_context.engaged`) is decided
+                    # entirely by the model's own start_engagement /
+                    # stop_engagement / stay_silent tool calls — see
+                    # agent.py and prompts.py. We deliberately do NOT do
+                    # server-side wake-word string matching here. That used
+                    # to be a second, competing source of truth: it can't
+                    # distinguish being *addressed* ("Chopper, what's up?")
+                    # from being *mentioned* ("I built an assistant called
+                    # Chopper"), and its turn-boundary snapshot raced
+                    # against stop_engagement() firing mid-turn, which was
+                    # swallowing the closing acknowledgment entirely.
+                    #
+                    # A fresh user utterance starts a fresh exchange, so
+                    # clear any leftover suppression from the previous one
+                    # as a belt-and-suspenders reset (normally already
+                    # cleared by the turn_complete handling below).
+                    session_context.suppress_current_turn = False
 
             # 2.Output Transcription (MODEL TTS)
             output_tx = getattr(event, "output_transcription", None)
@@ -246,7 +263,9 @@ async def agent_to_client_messaging(
                         #     json.dumps({"type": "capture_image"})
                         # )
 
-            # 4. Suppress output if the agent called stay_silent
+            # 4. Suppress output if the agent called stay_silent this turn.
+            # This is now the ONLY thing that can suppress a turn — no
+            # server-side "not engaged" fallback anymore. See note above.
             if session_context.suppress_current_turn:
                 message["parts"] = []
                 message["output_transcription"] = None
@@ -262,7 +281,9 @@ async def agent_to_client_messaging(
             ):
                 await websocket.send_text(json.dumps(message))
 
-            # 5. Reset turn flags on completion
+            # 5. Reset the suppression flag at the end of this turn. This is
+            # the only other place suppress_current_turn is cleared besides
+            # the fresh-utterance reset above.
             if event.turn_complete:
                 session_context.suppress_current_turn = False
 
@@ -303,6 +324,10 @@ async def client_to_agent_messaging(
                     if not data:
                         logging.warning("text/plain message missing data field")
                         continue
+
+                    # Engagement is decided by the model's own tool calls,
+                    # not by string-matching here — see the note in
+                    # agent_to_client_messaging above.
                     content = Content(
                         role="user", parts=[Part.from_text(text=data)]
                     )
@@ -315,6 +340,15 @@ async def client_to_agent_messaging(
                         Blob(data=decoded_data, mime_type=mime_type)
                     )
                     # logging.info("Sent realtime audio blob to agent queue (audio/pcm)")
+
+                elif mime_type == "application/x-google-auth":
+                    data = message.get("data")
+                    if data:
+                        session_context.google_access_token = data
+                        logging.info("Google OAuth token received and stored for user session.")
+                    else:
+                        logging.warning("application/x-google-auth message missing data field")
+                    continue
 
                 elif mime_type.startswith("image/"):
                     data = message.get("data")
@@ -389,8 +423,8 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
         resolved_user_id, control_queue, session_context
     )
 
-    content = Content(role="user", parts=[Part.from_text(text="Start")])
-    live_request_queue.send_content(content=content)
+    # content = Content(role="user", parts=[Part.from_text(text="Start")])
+    # live_request_queue.send_content(content=content)
 
     agent_to_client_task = asyncio.create_task(
         agent_to_client_messaging(websocket, live_events, session_context)
@@ -413,4 +447,3 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
 
     live_request_queue.close()
     logging.info("Client #%s disconnected", resolved_user_id)
-

@@ -6,7 +6,12 @@ class AuthService {
 
   static final AuthService instance = AuthService._();
 
-  final GoogleSignIn _googleSignIn = GoogleSignIn(scopes: ['email', 'profile']);
+  final GoogleSignIn _googleSignIn = GoogleSignIn(scopes: [
+    'email',
+    'profile',
+    'https://www.googleapis.com/auth/calendar.events',
+    'https://www.googleapis.com/auth/tasks',
+  ]);
 
   Future<UserCredential?> signInWithGoogleMobile() async {
     final googleUser = await _googleSignIn.signIn();
@@ -19,6 +24,13 @@ class AuthService {
     );
 
     return FirebaseAuth.instance.signInWithCredential(credential);
+  }
+
+  Future<String?> getGoogleAccessToken() async {
+    final googleUser = _googleSignIn.currentUser ?? await _googleSignIn.signInSilently();
+    if (googleUser == null) return null;
+    final googleAuth = await googleUser.authentication;
+    return googleAuth.accessToken;
   }
 
   Future<String?> getIdToken() async {
