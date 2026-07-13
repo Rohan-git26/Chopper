@@ -736,10 +736,29 @@ void camera_unlock()
     }
 }
 
-// Grab a guaranteed-fresh frame: discard the frame the driver already has
-// buffered (which can be a moment old — even with fb_count=2/GRAB_LATEST for
-// infrequent, on-demand captures), then grab the next one. Shared by the BLE
-// capture path (take_photo) and the WiFi /photo handler so both behave the same.
+// Find the first End-Of-Image marker (0xFFD9) after the Start-Of-Image and
+// return the length up to and including it, or 0 if the frame has no EOI at all
+// (a truncated capture). In baseline JPEG a raw 0xFFD9 only occurs as EOI (scan
+// data is byte-stuffed, restart markers are 0xFFD0..D7), so the first one is the
+// true end of the image.
+static size_t jpeg_eoi_len(const uint8_t *buf, size_t len)
+{
+    if (buf == nullptr || len < 4 || buf[0] != 0xFF || buf[1] != 0xD8) {
+        return 0;
+    }
+    for (size_t i = 2; i + 1 < len; i++) {
+        if (buf[i] == 0xFF && buf[i + 1] == 0xD9) {
+            return i + 2;
+        }
+    }
+    return 0; // no EOI — truncated frame
+}
+
+// Grab a guaranteed-fresh, valid frame. Discards the frame the driver already
+// has buffered (which can be a moment old — even with fb_count=2/GRAB_LATEST for
+// infrequent, on-demand captures), grabs the next one, retries once if that
+// frame is truncated, then trims any stale tail. Shared by the BLE capture path
+// (take_photo) and the WiFi /photo handler so both behave the same.
 camera_fb_t *capture_fresh_frame()
 {
     camera_lock();
@@ -748,7 +767,31 @@ camera_fb_t *capture_fresh_frame()
         esp_camera_fb_return(stale);
     }
     camera_fb_t *f = esp_camera_fb_get();
+
+    // ~5% of esp32-camera captures come back truncated (no EOI) — a known
+    // library-level glitch (espressif/esp32-camera#162). Trimming can't salvage
+    // a frame with no end marker, so discard it and re-grab once; the next frame
+    // is almost always fine.
+    if (f && jpeg_eoi_len(f->buf, f->len) == 0) {
+        Serial.println("Camera frame missing EOI; discarding and re-grabbing.");
+        esp_camera_fb_return(f);
+        f = esp_camera_fb_get();
+    }
     camera_unlock();
+
+    // fb_count=2 + GRAB_LATEST can overshoot f->len, trailing stale bytes from
+    // the previous frame past the real end-of-image — a valid JPEG followed by
+    // garbage (two FFD9 markers, ~2x size) that decoders such as Gemini reject.
+    // Trim to the true EOI so callers (BLE upload + WiFi /photo, both stream
+    // f->len bytes) don't send the junk.
+    if (f) {
+        size_t eoi = jpeg_eoi_len(f->buf, f->len);
+        if (eoi != 0 && eoi != f->len) {
+            Serial.printf("Trimmed JPEG tail: %u -> %u bytes\n",
+                          (unsigned) f->len, (unsigned) eoi);
+            f->len = eoi;
+        }
+    }
     return f;
 }
 
@@ -1096,4 +1139,3 @@ void loop_app()
         delay(50); // Reduced delay with light sleep
     }
 }
-
