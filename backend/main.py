@@ -8,6 +8,7 @@ from datetime import datetime
 
 from dotenv import load_dotenv
 from chopper_agent.agent import build_agent, SessionContext
+from chopper_agent.deferred import ResultDispatcher
 from fastapi import FastAPI, WebSocket, WebSocketDisconnect, status
 from google.adk.agents import LiveRequestQueue
 from google.adk.agents.run_config import RunConfig
@@ -134,7 +135,11 @@ async def start_agent_session(
 ):
     """Starts an agent session"""
 
-    agent = build_agent(control_queue, session_context, user_id, MEMORIES_DIR)
+    # Per-session dispatcher for slow "fire-and-continue" tools (web search,
+    # Hermes). Constructed here (on the event loop) so it can capture the loop.
+    dispatcher = ResultDispatcher(session_context)
+
+    agent = build_agent(control_queue, session_context, user_id, MEMORIES_DIR, dispatcher)
 
     # Create a Runner
     runner = InMemoryRunner(app_name=os.getenv("APP_NAME"), agent=agent)
@@ -148,6 +153,8 @@ async def start_agent_session(
 
     # Create a LiveRequestQueue for this session
     live_request_queue = LiveRequestQueue()
+    # The dispatcher injects deferred tool results through this same queue.
+    dispatcher.live_request_queue = live_request_queue
     logging.debug("LiveRequestQueue created")
 
     # Setup RunConfig
@@ -181,7 +188,7 @@ async def start_agent_session(
         run_config=run_config,
     )
     logging.info("Agent live session started")
-    return live_events, live_request_queue
+    return live_events, live_request_queue, dispatcher
 
 
 
@@ -189,6 +196,7 @@ async def agent_to_client_messaging(
     websocket: WebSocket,
     live_events,
     session_context: SessionContext,
+    dispatcher: ResultDispatcher,
 ):
 
     async for event in live_events:
@@ -203,9 +211,38 @@ async def agent_to_client_messaging(
                 "output_transcription": None,
             }
 
+            # 0. Engagement pre-apply (cold-start race fix).
+            # The model calls start_engagement in the SAME parallel tool batch
+            # as gated action tools (capture_image, calendar/task tools). ADK
+            # dispatches that batch with asyncio.gather (no ordering guarantee,
+            # see flows/llm_flows/functions.py:handle_function_calls_live), so a
+            # gated tool can execute BEFORE start_engagement and get rejected by
+            # require_engaged — dropping the very action the user asked for on
+            # the first addressed turn.
+            #
+            # This event carries the whole function-call batch and is yielded to
+            # us BEFORE ADK runs the tools: _postprocess_live yields the model
+            # response event, and only executes handle_function_calls_live when
+            # we pull the NEXT event. So applying engagement here lands before
+            # the gated tools run, closing the race deterministically with no
+            # polling. The start_engagement tool body still runs afterward and
+            # just re-sets the flag (idempotent).
+            #
+            # We deliberately do NOT pre-apply stop_engagement here: it isn't
+            # racy (the closing turn calls no gated action tools), and setting
+            # engaged=False early could wrongly block a gated tool that happened
+            # to be co-called. stop_engagement is left to its own tool body.
+            for fc in (event.get_function_calls() or []):
+                if fc.name == "start_engagement" and not session_context.engaged:
+                    logging.info("Pre-applying engagement (start_engagement in tool batch).")
+                    session_context.engaged = True
+
             # 1. Input Transcription (USER STT)
             input_tx = getattr(event, "input_transcription", None)
             if input_tx and getattr(input_tx, "text", None):
+                # User is speaking → model isn't idle; hold deferred results until
+                # the model next goes idle so they don't land mid-utterance.
+                dispatcher.idle = False
                 is_final = getattr(input_tx, "finished", False)
                 message["input_transcription"] = {
                     "text": input_tx.text,
@@ -249,6 +286,8 @@ async def agent_to_client_messaging(
                     if inline_data and getattr(inline_data, "mime_type", "").startswith("audio/pcm"):
                         audio_data = getattr(inline_data, "data", None)
                         if audio_data:
+                            # Model is producing audio → not idle.
+                            dispatcher.idle = False
                             encoded = base64.b64encode(audio_data).decode("ascii")
                             message["parts"].append({
                                 "type": "audio/pcm",
@@ -286,6 +325,11 @@ async def agent_to_client_messaging(
             # the fresh-utterance reset above.
             if event.turn_complete:
                 session_context.suppress_current_turn = False
+                # The model is now idle: deliver any deferred tool results that
+                # finished while it was busy (manual WHEN_IDLE). Delivery may set
+                # suppress_current_turn again (manual SILENT) for the new turn.
+                dispatcher.idle = True
+                await dispatcher.flush_ready()
 
         except Exception as e:
             logging.error("agent_to_client_messaging error: %s", e)
@@ -419,7 +463,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
     resolved_user_id = auth_user_id
     control_queue: asyncio.Queue = asyncio.Queue()
     session_context = SessionContext()
-    live_events, live_request_queue = await start_agent_session(
+    live_events, live_request_queue, dispatcher = await start_agent_session(
         resolved_user_id, control_queue, session_context
     )
 
@@ -427,7 +471,7 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
     # live_request_queue.send_content(content=content)
 
     agent_to_client_task = asyncio.create_task(
-        agent_to_client_messaging(websocket, live_events, session_context)
+        agent_to_client_messaging(websocket, live_events, session_context, dispatcher)
     )
     client_to_agent_task = asyncio.create_task(
         client_to_agent_messaging(websocket, live_request_queue, session_context)
@@ -444,6 +488,9 @@ async def websocket_endpoint(websocket: WebSocket, user_id: str):
             if not task.done():
                 task.cancel()
         await asyncio.gather(*tasks, return_exceptions=True)
+        # Cancel any in-flight background tool jobs so they don't try to inject
+        # into a closed queue after the client is gone.
+        dispatcher.cancel_all()
 
     live_request_queue.close()
     logging.info("Client #%s disconnected", resolved_user_id)

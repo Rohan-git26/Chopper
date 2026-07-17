@@ -20,6 +20,11 @@ import os
 from google.adk.agents import Agent
 
 from .prompts import AGENT_INSTRUCTION
+from .deferred import (
+    ResultDispatcher,
+    make_web_search_tool,
+    make_ask_hermes_tool,
+)
 from .google_tools import (
     make_google_calendar_tool,
     make_google_tasks_tool,
@@ -211,6 +216,7 @@ def build_agent(
     session_context: SessionContext,
     user_id: str,
     memories_dir: str = "memories",
+    dispatcher: "ResultDispatcher | None" = None,
 ) -> Agent:
     memory_content = load_memory(user_id, memories_dir)
 
@@ -240,6 +246,14 @@ def build_agent(
         gated("get_agenda", make_get_agenda_tool(session_context)),
         gated("complete_google_task", make_complete_google_task_tool(session_context)),
     ]
+
+    # Slow "fire-and-continue" tools: they return instantly and run their real
+    # work in the background via the dispatcher, which injects the result back
+    # into the live session when the model is idle (see deferred.py). Gated like
+    # the other action tools — you must be addressed/engaged to trigger them.
+    if dispatcher is not None:
+        action_tools.append(gated("web_search", make_web_search_tool(dispatcher)))
+        action_tools.append(gated("ask_hermes", make_ask_hermes_tool(dispatcher)))
 
     return Agent(
         name="chopper_agent",
