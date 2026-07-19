@@ -21,6 +21,8 @@
 float batteryVoltage = 0.0f;
 int batteryPercentage = 0;
 unsigned long lastBatteryCheck = 0;
+static int batterySensePin = BATTERY_ADC_PIN;
+static bool batterySenseDetected = false;
 
 // Device power state
 bool deviceActive = true;
@@ -527,12 +529,76 @@ class OTAControlCallback : public BLECharacteristicCallbacks
 // -------------------------------------------------------------------------
 // Battery Functions
 // -------------------------------------------------------------------------
+static bool sampleBatteryAdcPin(int pin, int samples, int *average, int *span)
+{
+    if (average == nullptr || span == nullptr || samples <= 0) {
+        return false;
+    }
+
+    pinMode(pin, INPUT);
+    analogSetPinAttenuation(pin, ADC_11db);
+
+    int minValue = 4095;
+    int maxValue = 0;
+    int adcSum = 0;
+
+    for (int i = 0; i < samples; i++) {
+        int value = analogRead(pin);
+        adcSum += value;
+        if (value < minValue) {
+            minValue = value;
+        }
+        if (value > maxValue) {
+            maxValue = value;
+        }
+        delay(2);
+    }
+
+    *average = adcSum / samples;
+    *span = maxValue - minValue;
+    return true;
+}
+
+static bool detectBatterySensePin()
+{
+    const int candidatePins[] = {BATTERY_ADC_PIN, 3, 4, 5, 6, 7, 8, 9};
+    const size_t candidateCount = sizeof(candidatePins) / sizeof(candidatePins[0]);
+
+    for (size_t i = 0; i < candidateCount; i++) {
+        int pin = candidatePins[i];
+        int average = 0;
+        int span = 0;
+        if (!sampleBatteryAdcPin(pin, 6, &average, &span)) {
+            continue;
+        }
+
+        Serial.printf("Battery ADC probe GPIO%d: avg=%d span=%d\n", pin, average, span);
+
+        // A wired divider should be stable and land somewhere between the rails.
+        // Floating pins tend to wander or pin to 0/4095, so reject those.
+        if (average > 50 && average < 4000 && span <= 32) {
+            batterySensePin = pin;
+            batterySenseDetected = true;
+            Serial.printf("Battery ADC selected GPIO%d\n", batterySensePin);
+            return true;
+        }
+    }
+
+    batterySenseDetected = false;
+    Serial.println("Battery ADC not detected on any candidate pin.");
+    return false;
+}
+
 void readBatteryLevel()
 {
+    if (!batterySenseDetected) {
+        return;
+    }
+
     // Take multiple ADC readings for stability
     int adcSum = 0;
     for (int i = 0; i < 10; i++) {
-        int value = analogRead(BATTERY_ADC_PIN);
+        int value = analogRead(batterySensePin);
         adcSum += value;
         delay(10);
     }
@@ -591,7 +657,7 @@ void readBatteryLevel()
 
 void updateBatteryService()
 {
-    if (batteryLevelCharacteristic) {
+    if (batteryLevelCharacteristic && batterySenseDetected) {
         uint8_t batteryLevel = (uint8_t) batteryPercentage;
         batteryLevelCharacteristic->setValue(&batteryLevel, 1);
 
@@ -649,11 +715,6 @@ void configure_ble()
     BLE2902 *batteryCcc = new BLE2902();
     batteryCcc->setNotifications(true);
     batteryLevelCharacteristic->addDescriptor(batteryCcc);
-
-    // Set initial battery level
-    readBatteryLevel();
-    uint8_t initialBatteryLevel = (uint8_t) batteryPercentage;
-    batteryLevelCharacteristic->setValue(&initialBatteryLevel, 1);
 
     // Device Information Service
     BLEService *deviceInfoService = server->createService(DEVICE_INFORMATION_SERVICE_UUID);
@@ -943,12 +1004,14 @@ void setup_app()
     Serial.print(PHOTO_CAPTURE_INTERVAL_MS / 1000);
     Serial.println(" seconds.");
 
-    // Initial battery reading
-    // Battery voltage divider
-    analogReadResolution(12);                           // optional: set 12-bit resolution
-    analogSetPinAttenuation(BATTERY_ADC_PIN, ADC_11db); // set attenuation for full 3.3V range
-
-    readBatteryLevel();
+    // Initial battery reading. Detect which ADC pin actually has the divider
+    // attached before publishing battery state to the app.
+    analogReadResolution(12);
+    detectBatterySensePin();
+    if (batterySenseDetected) {
+        readBatteryLevel();
+        updateBatteryService();
+    }
     deviceState = DEVICE_ACTIVE;
 
     // Initialize audio subsystem
