@@ -25,6 +25,22 @@ enum DeviceConnectionState { disconnected, scanning, connecting, connected, erro
 /// WiFi photo-transport state, mirrored from the device over BLE.
 enum WifiPhotoStatus { disconnected, connecting, connected, failed }
 
+/// A reassembled JPEG from the glasses plus the rotation (in degrees clockwise)
+/// that should be applied before use. The firmware ships an orientation hint on
+/// the BLE path (`config.h` `FIXED_IMAGE_ORIENTATION`, currently 180°); transports
+/// without a hint (WiFi `/photo`) fall back to [kDefaultPhotoOrientationDegrees].
+class DevicePhoto {
+  DevicePhoto(this.bytes, this.orientationDegrees);
+  final Uint8List bytes;
+  final int orientationDegrees;
+}
+
+/// Rotation to assume when the transport carries no orientation byte. The camera
+/// is physically mounted the same way regardless of transport, so this mirrors
+/// the firmware's fixed BLE orientation (180°). Also used by the live-video
+/// snapshot path, whose MJPEG frames carry no orientation metadata either.
+const int kDefaultPhotoOrientationDegrees = 180;
+
 // WiFi photo protocol — must match firmware/src/wifi_photo.h.
 const int _wifiCmdSetWifi = 0x10; // [0x10, ssidLen, ssid..., passLen, pass...]
 const int _wifiCmdDisconnect = 0x11; // [0x11]
@@ -54,13 +70,13 @@ class OmiDeviceService {
   final _stateController = StreamController<DeviceConnectionState>.broadcast();
   final _opusFrameController = StreamController<Uint8List>.broadcast();
   final _batteryController = StreamController<int>.broadcast();
-  final _photoDataController = StreamController<Uint8List>.broadcast();
+  final _photoDataController = StreamController<DevicePhoto>.broadcast();
   final _wifiStatusController = StreamController<WifiPhotoStatus>.broadcast();
 
   Stream<DeviceConnectionState> get connectionState => _stateController.stream;
   Stream<Uint8List> get opusFrames => _opusFrameController.stream;
   Stream<int> get batteryLevel => _batteryController.stream;
-  Stream<Uint8List> get photoData => _photoDataController.stream;
+  Stream<DevicePhoto> get photoData => _photoDataController.stream;
 
   /// WiFi photo-transport status, reported by the device over BLE.
   Stream<WifiPhotoStatus> get wifiStatus => _wifiStatusController.stream;
@@ -415,8 +431,12 @@ class OmiDeviceService {
 
   void _emitPhoto() {
     if (!_photoInProgress || _photoBuffer.isEmpty) return;
-    AppLog.instance.add('📸 photo assembled: ${_photoBuffer.length} bytes');
-    _photoDataController.add(Uint8List.fromList(_photoBuffer));
+    // Firmware orientation byte is an enum ordinal (0/1/2/3 => 0/90/180/270°).
+    // Absent (older fw / non-BLE) => assume the device's fixed orientation.
+    final degrees =
+        _photoOrientation != null ? (_photoOrientation! * 90) % 360 : kDefaultPhotoOrientationDegrees;
+    AppLog.instance.add('📸 photo assembled: ${_photoBuffer.length} bytes (rotate $degrees°)');
+    _photoDataController.add(DevicePhoto(Uint8List.fromList(_photoBuffer), degrees));
     _photoBuffer.clear();
     _photoInProgress = false;
     _photoOrientation = null;
@@ -525,7 +545,9 @@ class OmiDeviceService {
       }
       final bytes = builder.takeBytes();
       AppLog.instance.add('📸 wifi photo received: ${bytes.length} bytes');
-      _photoDataController.add(Uint8List.fromList(bytes));
+      // The WiFi /photo path carries no orientation byte; assume the device's
+      // fixed orientation so downstream rotation matches the BLE path.
+      _photoDataController.add(DevicePhoto(Uint8List.fromList(bytes), kDefaultPhotoOrientationDegrees));
     } catch (e) {
       AppLog.instance.add('📸 wifi capture FAILED: $e');
       rethrow;
@@ -570,4 +592,4 @@ class OmiDeviceService {
     _wifiStatusController.close();
   }
 }
-
+

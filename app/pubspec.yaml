@@ -52,6 +52,9 @@ dependencies:
 
   # Attachments.
   image_picker: ^1.1.2
+
+  # JPEG decode/rotate/re-encode for device photo orientation.
+  image: ^4.3.0
   file_selector: ^1.0.3
   path_provider: ^2.1.5
 
@@ -140,4 +143,4 @@ flutter_launcher_icons:
   ios: false
   image_path: "assets/logo.png"
 
-
+

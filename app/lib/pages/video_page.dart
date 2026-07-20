@@ -4,6 +4,7 @@ import 'package:flutter/material.dart';
 import 'package:provider/provider.dart';
 
 import '../providers/chat_provider.dart';
+import '../services/omi_device_service.dart' show kDefaultPhotoOrientationDegrees;
 
 /// Live video viewer. The MJPEG stream is owned by [ChatProvider] (so the
 /// capture path can snapshot the latest frame while streaming); this page just
@@ -81,12 +82,19 @@ class _VideoPageState extends State<VideoPage> {
                               Colors.white38,
                             );
                           }
-                          return Image.memory(
-                            frame,
-                            gaplessPlayback: true,
-                            fit: BoxFit.contain,
-                            width: double.infinity,
-                            height: double.infinity,
+                          // MJPEG frames arrive in the raw sensor orientation
+                          // (no metadata); rotate for display to match the
+                          // device's fixed orientation used by the capture path.
+                          // Display-only — no re-encode, so it's cheap.
+                          return RotatedBox(
+                            quarterTurns: kDefaultPhotoOrientationDegrees ~/ 90,
+                            child: Image.memory(
+                              frame,
+                              gaplessPlayback: true,
+                              fit: BoxFit.contain,
+                              width: double.infinity,
+                              height: double.infinity,
+                            ),
                           );
                         },
                       );
@@ -143,4 +151,4 @@ class _VideoPageState extends State<VideoPage> {
     );
   }
 }
-
+

@@ -6,6 +6,7 @@ import 'dart:typed_data';
 import 'package:flutter/foundation.dart';
 import 'package:flutter_blue_plus/flutter_blue_plus.dart' as fbp;
 import 'package:flutter_foreground_task/flutter_foreground_task.dart';
+import 'package:image/image.dart' as img;
 import 'package:path_provider/path_provider.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
@@ -22,6 +23,20 @@ enum AgentConnection { connecting, connected, disconnected }
 
 /// Which transport carries captured photos from the glasses to the app.
 enum PhotoTransport { ble, wifi }
+
+/// Rotate a JPEG by [degrees] clockwise, re-encoding as JPEG. Top-level so it
+/// can run in an isolate via [compute] — decoding a VGA frame off the UI thread
+/// keeps audio playback smooth. Returns the input unchanged on a no-op (0°) or
+/// decode failure, so a bad frame is still delivered rather than dropped.
+Uint8List _rotateJpegIsolate((Uint8List, int) arg) {
+  final (bytes, degrees) = arg;
+  final norm = ((degrees % 360) + 360) % 360;
+  if (norm == 0) return bytes;
+  final decoded = img.decodeJpg(bytes);
+  if (decoded == null) return bytes;
+  final rotated = img.copyRotate(decoded, angle: norm);
+  return img.encodeJpg(rotated, quality: 85);
+}
 
 /// Orchestrates the chat: owns the message list + composer state, drives the
 /// [AdkAgentService] and [AudioIo], and folds streamed agent events back into
@@ -220,8 +235,8 @@ class ChatProvider extends ChangeNotifier {
               // NOTE: this is the stream resolution (CIF ~400x296), lower than a
               // dedicated VGA still — the agent's vision input is degraded here.
               AppLog.instance.add('📸 snapshot from live video (CIF, ${snapshot.length} bytes)');
-              _service.sendBlob(snapshot, 'image/jpeg');
-              _handleDevicePhoto(snapshot);
+              // MJPEG frames carry no orientation byte; use the device default.
+              _sendOrientedPhoto(snapshot, kDefaultPhotoOrientationDegrees);
             } else {
               AppLog.instance.add('📸 capture skipped: live stream has no frame yet');
             }
@@ -359,7 +374,7 @@ class ChatProvider extends ChangeNotifier {
   /// Stream of scanned BLE devices (populated after startDeviceScan).
   StreamSubscription<fbp.BluetoothDevice>? _scanSub;
   StreamSubscription<Uint8List>? _deviceAudioSub;
-  StreamSubscription<Uint8List>? _devicePhotoSub;
+  StreamSubscription<DevicePhoto>? _devicePhotoSub;
 
   /// Callback called when a device is discovered during a scan. The UI
   /// collects these and shows a list.
@@ -422,11 +437,10 @@ class ChatProvider extends ChangeNotifier {
         }
       });
 
-      // Wire reassembled JPEGs from the glasses → send to server as blobs.
-      _devicePhotoSub = _device.photoData.listen((jpeg) {
-        AppLog.instance.add('📸 photo sent to agent: ${jpeg.length} bytes');
-        _service.sendBlob(jpeg, 'image/jpeg');
-        _handleDevicePhoto(jpeg);
+      // Wire reassembled JPEGs from the glasses → rotate to the correct
+      // orientation → send to server as blobs.
+      _devicePhotoSub = _device.photoData.listen((photo) {
+        _sendOrientedPhoto(photo.bytes, photo.orientationDegrees);
       });
     } catch (e, s) {
       // Connection or codec mismatch — surface in UI via deviceState stream.
@@ -521,6 +535,21 @@ class ChatProvider extends ChangeNotifier {
     notifyListeners();
   }
 
+  /// Rotate a captured JPEG to the correct orientation (off the UI thread),
+  /// then forward it to the agent and add it to the chat. Rotation failures
+  /// fall back to the raw bytes so a capture is never silently lost.
+  Future<void> _sendOrientedPhoto(Uint8List jpeg, int degrees) async {
+    Uint8List oriented = jpeg;
+    try {
+      oriented = await compute(_rotateJpegIsolate, (jpeg, degrees));
+    } catch (e) {
+      AppLog.instance.add('📸 rotate failed ($degrees°): $e');
+    }
+    AppLog.instance.add('📸 photo sent to agent: ${oriented.length} bytes');
+    _service.sendBlob(oriented, 'image/jpeg');
+    _handleDevicePhoto(oriented);
+  }
+
   Future<void> _handleDevicePhoto(Uint8List jpeg) async {
     try {
       final tempDir = await getTemporaryDirectory();
@@ -601,4 +630,4 @@ class ChatProvider extends ChangeNotifier {
   }
 }
 
-
+
